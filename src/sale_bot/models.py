@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 ProviderName = Literal["daangn", "joongna", "bunjang"]
+VALID_PROVIDERS = frozenset({"daangn", "joongna", "bunjang"})
 
 
 @dataclass(slots=True)
@@ -29,9 +30,10 @@ class Watch:
         title = listing.title.casefold()
         if any(word.casefold() in title for word in self.exclude_keywords):
             return False
-        if listing.price is not None:
-            if self.min_price is not None and listing.price < self.min_price:
-                return False
-            if self.max_price is not None and listing.price > self.max_price:
-                return False
+        if listing.price is None:
+            return self.min_price is None and self.max_price is None
+        if self.min_price is not None and listing.price < self.min_price:
+            return False
+        if self.max_price is not None and listing.price > self.max_price:
+            return False
         return True
