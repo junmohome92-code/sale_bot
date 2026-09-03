@@ -6,20 +6,17 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-function Get-PythonCommand {
+function Invoke-SystemPython {
+    param([string[]]$Args)
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        return @("py", "-3.12")
+        & py -3.12 @Args
+        return
     }
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        return @("python")
+        & python @Args
+        return
     }
     throw "Python 3.12+ is required. Install Python and re-run: .\\win.ps1 setup"
-}
-
-function Invoke-Python {
-    param([string[]]$Args)
-    $cmd = Get-PythonCommand
-    & $cmd[0] @($cmd[1..($cmd.Length - 1)]) @Args
 }
 
 function Import-DotEnv {
@@ -50,7 +47,7 @@ function Ensure-LocalFiles {
 function Ensure-Venv {
     if (-not (Test-Path ".venv\\Scripts\\python.exe")) {
         Write-Host "Creating .venv ..."
-        Invoke-Python -Args @("-m", "venv", ".venv")
+        Invoke-SystemPython -Args @("-m", "venv", ".venv")
     }
 }
 
