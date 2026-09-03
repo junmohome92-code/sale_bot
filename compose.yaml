@@ -1,0 +1,16 @@
+services:
+  sale-bot:
+    build: .
+    container_name: sale-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SALE_BOT_CONFIG: /app/config.yaml
+      SALE_BOT_DB: /data/sale_bot.sqlite3
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - sale_bot_data:/data
+
+volumes:
+  sale_bot_data:
