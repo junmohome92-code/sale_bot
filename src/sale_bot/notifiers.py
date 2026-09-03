@@ -65,7 +65,7 @@ class Notifier:
         for channel, job in jobs:
             try:
                 await job
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one channel must not block the others
                 print(f"[{channel}] notifier error: {exc}")
 
     async def _telegram(self, token: str, chat_id: str, text: str) -> None:
