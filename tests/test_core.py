@@ -4,7 +4,7 @@ from sale_bot.admin import handle_command
 from sale_bot.models import Listing, Watch
 from sale_bot.notifiers import format_message
 from sale_bot.providers import parse_price
-from sale_bot.storage import Change, MAX_WATCH_SLOTS, Store
+from sale_bot.storage import MAX_WATCH_SLOTS, Change, Store
 
 
 def test_parse_price_ignores_model_numbers():
