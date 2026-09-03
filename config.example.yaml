@@ -1,0 +1,19 @@
+poll_interval_seconds: 300
+alert_on_first_seen: true
+alert_on_price_increase: false
+request_timeout_seconds: 20
+
+watches:
+  - name: "RX 9070 XT"
+    query: "9070 xt"
+    min_price: 500000
+    max_price: 1200000
+    exclude_keywords:
+      - "삽니다"
+      - "구매"
+      - "매입"
+    providers:
+      - daangn
+      - joongna
+      - bunjang
+    daangn_region: "청주시"
