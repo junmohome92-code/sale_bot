@@ -97,6 +97,23 @@ def test_alert_receipt_allows_each_listing_only_once(tmp_path):
         reopened.close()
 
 
+def test_delete_watch_clears_bootstrap_and_alert_receipts(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    listing = Listing("daangn", "abc", "9070 XT", 850000, "https://example.com/abc")
+    try:
+        watch_id = store.add_watch("9070 XT", 900000)
+        store.mark_bootstrapped("9070 XT", "daangn")
+        assert store.reserve_alert("9070 XT", listing)
+        assert store.delete_watch(watch_id)
+
+        new_id = store.add_watch("9070 XT", 900000)
+        assert new_id != watch_id
+        assert not store.is_bootstrapped("9070 XT", "daangn")
+        assert store.reserve_alert("9070 XT", listing)
+    finally:
+        store.close()
+
+
 def test_seed_only_happens_once_even_after_all_watches_deleted(tmp_path):
     store = Store(tmp_path / "sale.sqlite3")
     seed = [Watch(name="gpu", query="gpu", max_price=500000)]
