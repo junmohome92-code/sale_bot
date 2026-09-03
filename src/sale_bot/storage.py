@@ -1,6 +1,6 @@
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .models import Listing
@@ -51,7 +51,7 @@ class Store:
         self.conn.commit()
 
     def observe(self, listing: Listing) -> Change:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         row = self.conn.execute(
             "SELECT price FROM listings WHERE provider=? AND external_id=?",
             (listing.provider, listing.external_id),
@@ -118,7 +118,7 @@ class Store:
         return row is not None
 
     def mark_bootstrapped(self, watch_name: str, provider: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self.conn.execute(
             "INSERT OR IGNORE INTO scan_state(watch_name,provider,bootstrapped_at) VALUES (?,?,?)",
             (watch_name, provider, now),
