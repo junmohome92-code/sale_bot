@@ -2,11 +2,12 @@ import asyncio
 import os
 
 import httpx
+from discord import Intents
 from discord.ext import commands
 
-from .storage import Store
+from .storage import MAX_WATCH_SLOTS, Store
 
-HELP_TEXT = """감시 관리 명령어
+HELP_TEXT = f"""감시 관리 명령어 (최대 {MAX_WATCH_SLOTS}개)
 /add 상품명 | 최대가격 | 당근지역(선택)
 /list
 /price ID 최대가격
@@ -39,8 +40,8 @@ def handle_command(text: str) -> str:
         if command == "/list":
             rows = store.list_watches()
             if not rows:
-                return "감시 항목이 없습니다."
-            lines = []
+                return f"감시 항목이 없습니다. (0/{MAX_WATCH_SLOTS})"
+            lines = [f"감시 슬롯: {len(rows)}/{MAX_WATCH_SLOTS}"]
             for watch_id, watch, enabled in rows:
                 status = "ON" if enabled else "PAUSE"
                 region = watch.daangn_region or "전체/미지정"
@@ -89,7 +90,14 @@ def handle_command(text: str) -> str:
                 return "해당 ID를 찾지 못했습니다."
             return f"#{watch_id} 삭제 완료"
         return HELP_TEXT
-    except (ValueError, TypeError):
+    except ValueError as exc:
+        message = str(exc)
+        if "slot limit" in message:
+            return f"감시 슬롯이 가득 찼습니다. 최대 {MAX_WATCH_SLOTS}개까지 등록할 수 있습니다."
+        if "already exists" in message:
+            return "같은 이름의 감시 항목이 이미 있습니다."
+        return "명령 형식이 올바르지 않습니다. /help 로 사용법을 확인하세요."
+    except TypeError:
         return "명령 형식이 올바르지 않습니다. /help 로 사용법을 확인하세요."
     finally:
         store.close()
@@ -117,10 +125,11 @@ async def run_telegram_admin() -> None:
                     if chat_id != str(allowed_chat) or not isinstance(text, str):
                         continue
                     reply = handle_command(text)
-                    await client.post(
+                    sent = await client.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
                         json={"chat_id": allowed_chat, "text": reply},
                     )
+                    sent.raise_for_status()
             except Exception as exc:  # noqa: BLE001 - admin loop must self-recover
                 print(f"[telegram-admin] error: {exc}")
                 await asyncio.sleep(5)
@@ -132,7 +141,7 @@ async def run_discord_admin() -> None:
     if not token or not allowed_user:
         return
 
-    intents = __import__("discord").Intents.default()
+    intents = Intents.default()
     intents.message_content = True
     bot = commands.Bot(command_prefix="/", intents=intents, help_command=None)
 
