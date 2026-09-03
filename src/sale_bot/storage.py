@@ -68,12 +68,19 @@ class Store:
               alerted_at TEXT NOT NULL,
               PRIMARY KEY (watch_name, provider, external_id)
             );
+            CREATE TABLE IF NOT EXISTS app_state (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
 
     def seed_watches(self, watches: list[Watch]) -> None:
-        if self.conn.execute("SELECT 1 FROM managed_watches LIMIT 1").fetchone():
+        seeded = self.conn.execute(
+            "SELECT 1 FROM app_state WHERE key='managed_watches_seeded'"
+        ).fetchone()
+        if seeded:
             return
         now = datetime.now(UTC).isoformat()
         for watch in watches[:MAX_WATCH_SLOTS]:
@@ -93,6 +100,9 @@ class Store:
                     now,
                 ),
             )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_state(key,value) VALUES ('managed_watches_seeded','1')"
+        )
         self.conn.commit()
 
     def list_watches(self, *, enabled_only: bool = False) -> list[tuple[int, Watch, bool]]:
@@ -118,16 +128,21 @@ class Store:
         ]
 
     def add_watch(self, name: str, max_price: int, region: str | None = None) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError("watch name is required")
         if max_price <= 0:
             raise ValueError("max_price must be positive")
         count = int(self.conn.execute("SELECT COUNT(*) FROM managed_watches").fetchone()[0])
         if count >= MAX_WATCH_SLOTS:
             raise ValueError(f"watch slot limit reached ({MAX_WATCH_SLOTS})")
+        if self.conn.execute("SELECT 1 FROM managed_watches WHERE name=?", (name,)).fetchone():
+            raise ValueError("watch name already exists")
         now = datetime.now(UTC).isoformat()
         cur = self.conn.execute(
             """INSERT INTO managed_watches
             (name,query,max_price,exclude_keywords,providers,daangn_region,created_at)
-            VALUES (?,?,?,'[]',?, ?,?)""",
+            VALUES (?,?,?,'[]',?,?,?)""",
             (name, name, max_price, json.dumps(["daangn", "joongna", "bunjang"]), region, now),
         )
         self.conn.commit()
@@ -162,6 +177,9 @@ class Store:
         return cur.rowcount > 0
 
     def update_exclude(self, watch_id: int, keyword: str, *, add: bool) -> bool:
+        keyword = keyword.strip()
+        if not keyword:
+            raise ValueError("exclude keyword is required")
         row = self.conn.execute(
             "SELECT exclude_keywords FROM managed_watches WHERE id=?", (watch_id,)
         ).fetchone()
