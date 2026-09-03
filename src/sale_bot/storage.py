@@ -149,9 +149,15 @@ class Store:
         return int(cur.lastrowid)
 
     def delete_watch(self, watch_id: int) -> bool:
-        cur = self.conn.execute("DELETE FROM managed_watches WHERE id=?", (watch_id,))
+        row = self.conn.execute("SELECT name FROM managed_watches WHERE id=?", (watch_id,)).fetchone()
+        if row is None:
+            return False
+        watch_name = str(row["name"])
+        self.conn.execute("DELETE FROM managed_watches WHERE id=?", (watch_id,))
+        self.conn.execute("DELETE FROM scan_state WHERE watch_name=?", (watch_name,))
+        self.conn.execute("DELETE FROM alert_receipts WHERE watch_name=?", (watch_name,))
         self.conn.commit()
-        return cur.rowcount > 0
+        return True
 
     def set_watch_enabled(self, watch_id: int, enabled: bool) -> bool:
         cur = self.conn.execute(
