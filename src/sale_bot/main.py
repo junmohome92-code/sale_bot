@@ -2,10 +2,15 @@ import argparse
 import asyncio
 import os
 
+from .admin import run_discord_admin, run_telegram_admin
 from .config import Settings, load_settings
 from .notifiers import Notifier, format_message
 from .providers import Provider, build_providers
 from .storage import Store
+
+
+def _db_path() -> str:
+    return os.getenv("SALE_BOT_DB", "sale_bot.sqlite3")
 
 
 async def _close_providers(providers: dict[str, Provider]) -> None:
@@ -17,8 +22,8 @@ async def _close_providers(providers: dict[str, Provider]) -> None:
 
 
 async def run_cycle(settings: Settings) -> None:
-    db_path = os.getenv("SALE_BOT_DB", "sale_bot.sqlite3")
-    store = Store(db_path)
+    store = Store(_db_path())
+    store.seed_watches(settings.watches)
     notifier = Notifier(settings.request_timeout_seconds)
     providers = build_providers(settings.request_timeout_seconds)
     channels = notifier.configured_channels()
@@ -28,7 +33,10 @@ async def run_cycle(settings: Settings) -> None:
         print(f"notification channels: {', '.join(channels)}")
 
     try:
-        for watch in settings.watches:
+        managed = store.list_watches(enabled_only=True)
+        if not managed:
+            print("no enabled watches configured")
+        for _, watch, _ in managed:
             for provider_name in watch.providers:
                 provider = providers[provider_name]
                 bootstrapped = store.is_bootstrapped(watch.name, provider_name)
@@ -45,16 +53,9 @@ async def run_cycle(settings: Settings) -> None:
                         continue
                     matched += 1
                     change = store.observe(listing)
-                    suppress_bootstrap = (
-                        settings.bootstrap_silently and not bootstrapped and change.kind == "new"
-                    )
-                    should_alert = not suppress_bootstrap and (
-                        (change.kind == "new" and settings.alert_on_first_seen)
-                        or change.kind == "price_down"
-                        or change.kind == "price_changed"
-                        or (change.kind == "price_up" and settings.alert_on_price_increase)
-                    )
-                    if should_alert:
+                    first_condition_match = store.reserve_alert(watch.name, listing)
+                    suppress_bootstrap = settings.bootstrap_silently and not bootstrapped
+                    if first_condition_match and not suppress_bootstrap:
                         alerts += 1
                         await notifier.send(format_message(watch.name, listing, change))
 
@@ -76,7 +77,7 @@ async def run_once() -> None:
     await run_cycle(settings)
 
 
-async def run_forever() -> None:
+async def run_poller() -> None:
     config_path = os.getenv("SALE_BOT_CONFIG", "config.yaml")
     while True:
         interval = 300
@@ -87,6 +88,10 @@ async def run_forever() -> None:
         except Exception as exc:  # noqa: BLE001 - polling daemon must recover next cycle
             print(f"poll cycle failed: {exc}")
         await asyncio.sleep(interval)
+
+
+async def run_forever() -> None:
+    await asyncio.gather(run_poller(), run_telegram_admin(), run_discord_admin())
 
 
 def cli() -> None:
