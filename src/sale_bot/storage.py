@@ -6,6 +6,8 @@ from pathlib import Path
 
 from .models import Listing, Watch
 
+MAX_WATCH_SLOTS = 3
+
 
 @dataclass(slots=True)
 class Change:
@@ -74,7 +76,7 @@ class Store:
         if self.conn.execute("SELECT 1 FROM managed_watches LIMIT 1").fetchone():
             return
         now = datetime.now(UTC).isoformat()
-        for watch in watches:
+        for watch in watches[:MAX_WATCH_SLOTS]:
             if watch.max_price is None:
                 continue
             self.conn.execute(
@@ -118,6 +120,9 @@ class Store:
     def add_watch(self, name: str, max_price: int, region: str | None = None) -> int:
         if max_price <= 0:
             raise ValueError("max_price must be positive")
+        count = int(self.conn.execute("SELECT COUNT(*) FROM managed_watches").fetchone()[0])
+        if count >= MAX_WATCH_SLOTS:
+            raise ValueError(f"watch slot limit reached ({MAX_WATCH_SLOTS})")
         now = datetime.now(UTC).isoformat()
         cur = self.conn.execute(
             """INSERT INTO managed_watches
