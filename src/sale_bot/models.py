@@ -34,6 +34,4 @@ class Watch:
             return self.min_price is None and self.max_price is None
         if self.min_price is not None and listing.price < self.min_price:
             return False
-        if self.max_price is not None and listing.price > self.max_price:
-            return False
-        return True
+        return self.max_price is None or listing.price <= self.max_price
