@@ -12,7 +12,7 @@ async def _close_providers(providers: dict[str, Provider]) -> None:
     for provider in providers.values():
         try:
             await provider.close()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - cleanup must not stop daemon shutdown
             print(f"[{provider.name}] close failed: {exc}")
 
 
@@ -34,7 +34,7 @@ async def run_cycle(settings: Settings) -> None:
                 bootstrapped = store.is_bootstrapped(watch.name, provider_name)
                 try:
                     listings = await provider.search(watch)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - one provider must not stop other scans
                     print(f"[{provider_name}] search failed for {watch.name}: {exc}")
                     continue
 
@@ -84,7 +84,7 @@ async def run_forever() -> None:
             settings = load_settings(config_path)
             interval = settings.poll_interval_seconds
             await run_cycle(settings)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - polling daemon must recover next cycle
             print(f"poll cycle failed: {exc}")
         await asyncio.sleep(interval)
 
