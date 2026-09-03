@@ -1,0 +1,32 @@
+name: windows-test-copy
+
+on:
+  push:
+    branches: [feature/windows-test-copy]
+  pull_request:
+    paths:
+      - "sale_bot - sale test win/**"
+      - ".github/workflows/windows-test-copy.yml"
+
+jobs:
+  windows-test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: "sale_bot - sale test win"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Ruff
+        shell: pwsh
+        run: python -m ruff check src tests
+      - name: Pytest
+        shell: pwsh
+        run: python -m pytest -q
