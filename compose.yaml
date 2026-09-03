@@ -1,16 +1,21 @@
 services:
   sale-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: sale-bot
     restart: unless-stopped
+    init: true
     env_file:
       - .env
     environment:
       SALE_BOT_CONFIG: /app/config.yaml
       SALE_BOT_DB: /data/sale_bot.sqlite3
+      TZ: Asia/Seoul
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - sale_bot_data:/data
+    shm_size: "256mb"
 
 volumes:
   sale_bot_data:
