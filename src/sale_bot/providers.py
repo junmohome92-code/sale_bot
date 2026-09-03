@@ -5,18 +5,25 @@ from urllib.parse import quote, urljoin
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from playwright.async_api import (
+    Browser,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from .models import Listing, Watch
 
-_PRICE_RE = re.compile(r"([0-9][0-9,]*)\s*원?")
+_PRICE_WITH_WON_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,})\s*원")
+_COMMA_PRICE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+)(?!\d)")
 _ID_RE = re.compile(r"/(?:products?|articles?)/(\d+)")
 
 
 def parse_price(text: str | None) -> int | None:
     if not text:
         return None
-    match = _PRICE_RE.search(text.replace(" ", ""))
+    normalized = text.replace("\u00a0", " ")
+    match = _PRICE_WITH_WON_RE.search(normalized) or _COMMA_PRICE_RE.search(normalized)
     if not match:
         return None
     try:
@@ -25,9 +32,70 @@ def parse_price(text: str | None) -> int | None:
         return None
 
 
+def coerce_price(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    return parse_price(text)
+
+
 def stable_id_from_url(url: str) -> str:
     match = _ID_RE.search(url)
     return match.group(1) if match else url.rstrip("/").split("/")[-1]
+
+
+def _balanced_json(text: str, start: int, opener: str) -> str | None:
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _extract_json_array(html: str, marker: str) -> list[dict]:
+    for candidate in (marker, marker.replace('"', '\\"')):
+        marker_index = html.find(candidate)
+        if marker_index < 0:
+            continue
+        tail = html[marker_index + len(candidate) :]
+        for value in (tail, tail.replace('\\"', '"').replace("\\\\", "\\")):
+            start = value.find("[")
+            if start < 0:
+                continue
+            payload = _balanced_json(value, start, "[")
+            if not payload:
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+    return []
 
 
 class Provider(ABC):
@@ -36,144 +104,224 @@ class Provider(ABC):
     @abstractmethod
     async def search(self, watch: Watch) -> list[Listing]: ...
 
+    async def close(self) -> None:
+        return None
+
 
 class JoongnaProvider(Provider):
     name = "joongna"
 
     def __init__(self, timeout: int = 20):
-        self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={
-            "User-Agent": "Mozilla/5.0 sale_bot/0.1 personal-monitor"
-        })
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 sale_bot/0.2 personal-monitor"},
+        )
 
     async def search(self, watch: Watch) -> list[Listing]:
         url = f"https://web.joongna.com/search/{quote(watch.query)}"
         response = await self.client.get(url)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        embedded = self._parse_embedded(response.text)
+        if embedded:
+            return embedded
+        return self._parse_anchors(response.text)
+
+    def _parse_embedded(self, html: str) -> list[Listing]:
+        rows = _extract_json_array(html, '"items":')
+        results: list[tuple[str, Listing]] = []
+        for row in rows:
+            seq = row.get("seq")
+            title = row.get("title")
+            if seq is None or not title:
+                continue
+            state = row.get("state")
+            if isinstance(state, int) and state != 0:
+                continue
+            locations = row.get("locationNames")
+            location = row.get("mainLocationName")
+            if not location and isinstance(locations, list) and locations:
+                location = locations[0]
+            listing = Listing(
+                "joongna",
+                str(seq),
+                str(title),
+                coerce_price(row.get("price")),
+                f"https://web.joongna.com/product/{seq}",
+                location=str(location) if location else None,
+                image_url=str(row.get("url")) if row.get("url") else None,
+            )
+            results.append((str(row.get("sortDate") or ""), listing))
+        results.sort(key=lambda item: item[0], reverse=True)
+        return [listing for _, listing in results]
+
+    def _parse_anchors(self, html: str) -> list[Listing]:
+        soup = BeautifulSoup(html, "html.parser")
         results: dict[str, Listing] = {}
         for anchor in soup.select('a[href*="/product/"]'):
             href = anchor.get("href")
             if not href:
                 continue
             full_url = urljoin("https://web.joongna.com", href)
-            title = (anchor.get_text(" ", strip=True) or anchor.get("aria-label") or "").strip()
-            if not title:
-                image = anchor.find("img")
-                title = (image.get("alt") if image else None) or "중고나라 매물"
-            price = parse_price(anchor.get_text(" ", strip=True))
+            text = anchor.get_text(" ", strip=True)
+            image = anchor.find("img")
+            title = (image.get("alt") if image else None) or text or "중고나라 매물"
             item_id = stable_id_from_url(full_url)
-            results[item_id] = Listing("joongna", item_id, title, price, full_url)
+            results[item_id] = Listing(
+                "joongna",
+                item_id,
+                str(title).strip(),
+                parse_price(text),
+                full_url,
+                image_url=(image.get("src") if image else None),
+            )
         return list(results.values())
+
+    async def close(self) -> None:
+        await self.client.aclose()
 
 
 class DaangnProvider(Provider):
     name = "daangn"
 
     def __init__(self, timeout: int = 20):
-        self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={
-            "User-Agent": "Mozilla/5.0 sale_bot/0.1 personal-monitor",
-            "Accept": "text/html,application/xhtml+xml,application/json",
-        })
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 sale_bot/0.2 personal-monitor",
+                "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+            },
+        )
+        self._region_cache: dict[str, dict] = {}
+
+    async def _resolve_region(self, region: str) -> dict:
+        if region in self._region_cache:
+            return self._region_cache[region]
+        response = await self.client.get(
+            "https://www.daangn.com/kr/api/v1/regions/keyword",
+            params={"keyword": region},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        locations = payload.get("locations") or []
+        if not locations:
+            raise RuntimeError(f"Daangn region not found: {region}")
+        exact = [
+            item
+            for item in locations
+            if region in (item.get("name"), item.get("name1"), item.get("name2"), item.get("name3"))
+        ]
+        depth_three = [item for item in locations if item.get("depth") == 3]
+        selected = (exact or depth_three or locations)[0]
+        self._region_cache[region] = selected
+        return selected
 
     async def search(self, watch: Watch) -> list[Listing]:
-        region = quote(watch.daangn_region or "대한민국")
-        query = quote(watch.query)
-        candidates = [
-            f"https://www.daangn.com/kr/buy-sell/?in={region}&search={query}",
-            f"https://www.daangn.com/search/{query}/",
-        ]
-        last_error: Exception | None = None
-        for url in candidates:
-            try:
-                response = await self.client.get(url)
-                response.raise_for_status()
-                parsed = self._parse_html(response.text, response.url.copy_with(query=None).human_repr())
-                if parsed:
-                    return parsed
-            except Exception as exc:
-                last_error = exc
-        if last_error:
-            raise last_error
-        return []
+        params: dict[str, str] = {
+            "search": watch.query,
+            "only_on_sale": "true",
+            "_data": "routes/kr.buy-sell._index",
+        }
+        path = "/kr/buy-sell/"
+        if watch.daangn_region:
+            region = await self._resolve_region(watch.daangn_region)
+            path = "/kr/buy-sell/all/"
+            params["in"] = f"{region['name']}-{region['id']}"
 
-    def _parse_html(self, html: str, base_url: str) -> list[Listing]:
-        soup = BeautifulSoup(html, "html.parser")
+        response = await self.client.get(f"https://www.daangn.com{path}", params=params)
+        response.raise_for_status()
+        payload = response.json()
+        all_page = payload.get("allPage")
+        if not isinstance(all_page, dict):
+            raise RuntimeError("Daangn search payload shape changed: allPage missing")
+        articles = all_page.get("fleamarketArticles")
+        if not isinstance(articles, list):
+            raise RuntimeError("Daangn search payload shape changed: fleamarketArticles missing")
+
         results: dict[str, Listing] = {}
-        for anchor in soup.select('a[href*="/articles/"], a[href*="/buy-sell/"]'):
-            href = anchor.get("href")
-            if not href:
+        for article in articles:
+            if not isinstance(article, dict):
                 continue
-            full_url = urljoin(base_url, href)
-            text = anchor.get_text(" ", strip=True)
-            title = text
-            image = anchor.find("img")
-            if image and image.get("alt"):
-                title = image.get("alt")
+            href = article.get("href") or article.get("webUrl")
+            title = article.get("title")
+            if not href or not title:
+                continue
+            full_url = urljoin("https://www.daangn.com", str(href))
             item_id = stable_id_from_url(full_url)
-            if not item_id or item_id in results:
-                continue
+            region_data = article.get("region")
+            location = region_data.get("name") if isinstance(region_data, dict) else None
+            image_url = article.get("imageUrl") or article.get("thumbnailUrl")
             results[item_id] = Listing(
-                "daangn", item_id, title or "당근 매물", parse_price(text), full_url
+                "daangn",
+                item_id,
+                str(title),
+                coerce_price(article.get("price")),
+                full_url,
+                location=str(location) if location else None,
+                image_url=str(image_url) if image_url else None,
             )
-        if results:
-            return list(results.values())
-
-        # Remix/Next 계열 페이지의 JSON payload가 노출되는 경우를 위한 보수적 fallback.
-        for script in soup.find_all("script"):
-            body = script.string or ""
-            if "article" not in body.lower() or "price" not in body.lower():
-                continue
-            try:
-                data = json.loads(body)
-            except Exception:
-                continue
-            self._walk_json(data, results)
         return list(results.values())
 
-    def _walk_json(self, value, results: dict[str, Listing]) -> None:
-        if isinstance(value, dict):
-            title = value.get("title") or value.get("name")
-            price = value.get("price")
-            item_id = value.get("id") or value.get("articleId")
-            url = value.get("url") or value.get("href")
-            if title and item_id and url:
-                try:
-                    parsed_price = int(price) if price is not None else None
-                except (TypeError, ValueError):
-                    parsed_price = parse_price(str(price))
-                results[str(item_id)] = Listing(
-                    "daangn", str(item_id), str(title), parsed_price,
-                    urljoin("https://www.daangn.com", str(url)),
-                    location=str(value.get("regionName")) if value.get("regionName") else None,
-                )
-            for child in value.values():
-                self._walk_json(child, results)
-        elif isinstance(value, list):
-            for child in value:
-                self._walk_json(child, results)
+    async def close(self) -> None:
+        await self.client.aclose()
 
 
 class BunjangProvider(Provider):
     name = "bunjang"
 
+    def __init__(self, timeout: int = 20):
+        self.timeout_ms = timeout * 1000
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+
+    async def _ensure_browser(self) -> Browser:
+        if self._browser is not None:
+            return self._browser
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(headless=True)
+        return self._browser
+
     async def search(self, watch: Watch) -> list[Listing]:
         url = f"https://m.bunjang.co.kr/search/products?order=date&page=1&q={quote(watch.query)}"
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            page = await browser.new_page(locale="ko-KR", viewport={"width": 430, "height": 932})
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(1500)
+        browser = await self._ensure_browser()
+        page = await browser.new_page(locale="ko-KR", viewport={"width": 430, "height": 932})
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            try:
+                await page.wait_for_selector(
+                    'a[href*="/products/"]', timeout=min(7000, self.timeout_ms)
+                )
+            except PlaywrightTimeoutError:
+                body = (await page.locator("body").inner_text()).strip()
+                no_results = ("검색 결과가 없습니다", "검색결과가 없습니다")
+                if body and any(word in body for word in no_results):
+                    return []
+                raise RuntimeError(
+                    "Bunjang search cards did not load; page structure or access may have changed"
+                )
             cards = await page.locator('a[href*="/products/"]').evaluate_all(
                 """
-                els => els.map(a => ({
-                  href: a.href,
-                  text: (a.innerText || '').trim(),
-                  title: a.querySelector('img')?.alt || (a.innerText || '').trim(),
-                  image: a.querySelector('img')?.src || null
-                }))
+                els => els.map(a => {
+                  const texts = [...a.querySelectorAll('div,span,p')]
+                    .map(n => (n.textContent || '').trim())
+                    .filter(Boolean);
+                  const priceText = texts.find(t => /^\\d{1,3}(,\\d{3})+\\s*원?$/.test(t))
+                    || texts.find(t => /^\\d{4,}\\s*원$/.test(t))
+                    || '';
+                  return {
+                    href: a.href,
+                    text: (a.innerText || '').trim(),
+                    title: a.querySelector('img')?.alt || texts[0] || '',
+                    priceText,
+                    image: a.querySelector('img')?.src || null
+                  };
+                })
                 """
             )
-            await browser.close()
+        finally:
+            await page.close()
+
         results: dict[str, Listing] = {}
         for card in cards:
             href = str(card.get("href") or "")
@@ -181,17 +329,31 @@ class BunjangProvider(Provider):
             if not match:
                 continue
             item_id = match.group(1)
+            price = parse_price(str(card.get("priceText") or ""))
+            if price is None:
+                price = parse_price(str(card.get("text") or ""))
             results[item_id] = Listing(
-                "bunjang", item_id, str(card.get("title") or "번개장터 매물"),
-                parse_price(str(card.get("text") or "")), href,
-                image_url=card.get("image"),
+                "bunjang",
+                item_id,
+                str(card.get("title") or "번개장터 매물").strip(),
+                price,
+                href,
+                image_url=str(card.get("image")) if card.get("image") else None,
             )
         return list(results.values())
+
+    async def close(self) -> None:
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
 
 
 def build_providers(timeout: int) -> dict[str, Provider]:
     return {
         "daangn": DaangnProvider(timeout),
         "joongna": JoongnaProvider(timeout),
-        "bunjang": BunjangProvider(),
+        "bunjang": BunjangProvider(timeout),
     }
