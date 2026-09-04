@@ -17,6 +17,7 @@ from .models import Listing, Watch
 _PRICE_WITH_WON_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,})\s*원")
 _COMMA_PRICE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+)(?!\d)")
 _ID_RE = re.compile(r"/(?:products?|articles?)/(\d+)")
+_DAANGN_SLUG_ID_RE = re.compile(r"-([a-z0-9]+)$", re.IGNORECASE)
 
 
 def parse_price(text: str | None) -> int | None:
@@ -48,6 +49,12 @@ def coerce_price(value: object) -> int | None:
 def stable_id_from_url(url: str) -> str:
     match = _ID_RE.search(url)
     return match.group(1) if match else url.rstrip("/").split("/")[-1]
+
+
+def daangn_id_from_url(url: str) -> str:
+    slug = url.rstrip("/").split("/")[-1]
+    match = _DAANGN_SLUG_ID_RE.search(slug)
+    return match.group(1) if match else slug
 
 
 def _balanced_json(text: str, start: int, opener: str) -> str | None:
@@ -95,6 +102,50 @@ def _extract_json_array(html: str, marker: str) -> list[dict]:
                 continue
             if isinstance(parsed, list):
                 return [item for item in parsed if isinstance(item, dict)]
+    return []
+
+
+def _extract_daangn_articles(html: str) -> list[dict]:
+    embedded = _extract_json_array(html, '"fleamarketArticles":')
+    if embedded:
+        return embedded
+
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("@type") != "ItemList":
+            continue
+        entries = payload.get("itemListElement")
+        if not isinstance(entries, list):
+            continue
+        rows: list[dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            item = entry.get("item")
+            if not isinstance(item, dict):
+                continue
+            offers = item.get("offers") if isinstance(item.get("offers"), dict) else {}
+            image = item.get("image")
+            if isinstance(image, list):
+                image = image[0] if image else None
+            rows.append(
+                {
+                    "href": item.get("url"),
+                    "title": item.get("name"),
+                    "price": offers.get("price"),
+                    "thumbnail": image,
+                    "status": "Ongoing",
+                }
+            )
+        if rows:
+            return rows
     return []
 
 
@@ -189,8 +240,8 @@ class DaangnProvider(Provider):
             timeout=timeout,
             follow_redirects=True,
             headers={
-                "User-Agent": "Mozilla/5.0 sale_bot/0.2 personal-monitor",
-                "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+                "User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor",
+                "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
             },
         )
         self._region_cache: dict[str, dict] = {}
@@ -218,40 +269,45 @@ class DaangnProvider(Provider):
         return selected
 
     async def _fetch_articles(self, watch: Watch, region_name: str | None) -> list[dict]:
-        params: dict[str, str] = {
-            "search": watch.query,
-            "only_on_sale": "true",
-            "_data": "routes/kr.buy-sell._index",
-        }
-        path = "/kr/buy-sell/"
+        params: dict[str, str] = {"search": watch.query}
         if region_name:
             region = await self._resolve_region(region_name)
-            path = "/kr/buy-sell/all/"
-            params["in"] = f"{region['name']}-{region['id']}"
+            region_id = region.get("dbId") or region.get("id")
+            region_label = region.get("name")
+            if not region_id or not region_label:
+                raise RuntimeError(f"Daangn region has no usable slug: {region_name}")
+            params["in"] = f"{region_label}-{region_id}"
 
-        response = await self.client.get(f"https://www.daangn.com{path}", params=params)
+        response = await self.client.get("https://www.daangn.com/kr/buy-sell/", params=params)
         response.raise_for_status()
-        payload = response.json()
-        all_page = payload.get("allPage")
-        if not isinstance(all_page, dict):
-            raise RuntimeError("Daangn search payload shape changed: allPage missing")
-        articles = all_page.get("fleamarketArticles")
-        if not isinstance(articles, list):
-            raise RuntimeError("Daangn search payload shape changed: fleamarketArticles missing")
-        return [article for article in articles if isinstance(article, dict)]
+        articles = _extract_daangn_articles(response.text)
+        if articles:
+            return articles
+
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        all_page = payload.get("allPage") if isinstance(payload, dict) else None
+        rows = all_page.get("fleamarketArticles") if isinstance(all_page, dict) else None
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
     def _parse_articles(self, articles: list[dict]) -> list[Listing]:
         results: dict[str, Listing] = {}
         for article in articles:
+            if str(article.get("status") or "Ongoing").casefold() == "closed":
+                continue
             href = article.get("href") or article.get("webUrl")
             title = article.get("title")
             if not href or not title:
                 continue
             full_url = urljoin("https://www.daangn.com", str(href))
-            item_id = stable_id_from_url(full_url)
+            item_id = str(article.get("id") or daangn_id_from_url(full_url))
             region_data = article.get("region")
-            location = region_data.get("name") if isinstance(region_data, dict) else None
-            image_url = article.get("imageUrl") or article.get("thumbnailUrl")
+            location = article.get("locationName")
+            if not location and isinstance(region_data, dict):
+                location = region_data.get("name")
+            image_url = article.get("thumbnail") or article.get("imageUrl") or article.get("thumbnailUrl")
             results[item_id] = Listing(
                 "daangn",
                 item_id,
