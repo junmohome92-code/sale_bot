@@ -30,4 +30,6 @@ jobs:
         run: .\win.ps1 test
       - name: SALE_TEST launcher smoke
         shell: cmd
+        env:
+          PYTHONUTF8: "1"
         run: (echo 0) | call SALE_TEST.bat
