@@ -3,7 +3,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import VALID_PROVIDERS, Watch
+from .models import VALID_PROVIDERS, Watch, split_daangn_regions
 
 
 @dataclass(slots=True)
@@ -34,6 +34,7 @@ def load_settings(path: str | Path) -> Settings:
             raise ValueError(f"unknown provider(s) in {watch.name}: {sorted(invalid)}")
         if not watch.providers:
             raise ValueError(f"watch {watch.name} must contain at least one provider")
+        split_daangn_regions(watch.daangn_region)
         if (
             watch.min_price is not None
             and watch.max_price is not None

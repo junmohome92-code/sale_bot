@@ -17,4 +17,5 @@ watches:
       - daangn
       - joongna
       - bunjang
-    daangn_region: "청주시"
+    # 당근 지역은 쉼표로 최대 5개까지 지정 가능
+    daangn_region: "복대동, 가경동, 봉명동, 사창동"
