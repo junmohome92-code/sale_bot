@@ -50,7 +50,7 @@ class Notifier:
             channels.append("kakao")
         return channels
 
-    async def send(self, message: Message) -> None:
+    async def send(self, message: Message) -> bool:
         jobs = []
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -62,11 +62,15 @@ class Notifier:
         kakao_token = os.getenv("KAKAO_ACCESS_TOKEN")
         if kakao_token:
             jobs.append(("kakao", self._kakao(kakao_token, message.text, message.url)))
+
+        delivered = False
         for channel, job in jobs:
             try:
                 await job
+                delivered = True
             except Exception as exc:  # noqa: BLE001 - one channel must not block the others
                 print(f"[{channel}] notifier error: {exc}")
+        return delivered
 
     async def _telegram(self, token: str, chat_id: str, text: str) -> None:
         response = await self.client.post(
