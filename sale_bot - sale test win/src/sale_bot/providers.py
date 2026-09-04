@@ -217,15 +217,15 @@ class DaangnProvider(Provider):
         self._region_cache[region] = selected
         return selected
 
-    async def search(self, watch: Watch) -> list[Listing]:
+    async def _fetch_articles(self, watch: Watch, region_name: str | None) -> list[dict]:
         params: dict[str, str] = {
             "search": watch.query,
             "only_on_sale": "true",
             "_data": "routes/kr.buy-sell._index",
         }
         path = "/kr/buy-sell/"
-        if watch.daangn_region:
-            region = await self._resolve_region(watch.daangn_region)
+        if region_name:
+            region = await self._resolve_region(region_name)
             path = "/kr/buy-sell/all/"
             params["in"] = f"{region['name']}-{region['id']}"
 
@@ -238,11 +238,11 @@ class DaangnProvider(Provider):
         articles = all_page.get("fleamarketArticles")
         if not isinstance(articles, list):
             raise RuntimeError("Daangn search payload shape changed: fleamarketArticles missing")
+        return [article for article in articles if isinstance(article, dict)]
 
+    def _parse_articles(self, articles: list[dict]) -> list[Listing]:
         results: dict[str, Listing] = {}
         for article in articles:
-            if not isinstance(article, dict):
-                continue
             href = article.get("href") or article.get("webUrl")
             title = article.get("title")
             if not href or not title:
@@ -261,6 +261,28 @@ class DaangnProvider(Provider):
                 location=str(location) if location else None,
                 image_url=str(image_url) if image_url else None,
             )
+        return list(results.values())
+
+    async def search(self, watch: Watch) -> list[Listing]:
+        region_names: list[str | None] = watch.daangn_regions or [None]
+        results: dict[str, Listing] = {}
+        errors: list[str] = []
+        successful_searches = 0
+
+        for region_name in region_names:
+            try:
+                articles = await self._fetch_articles(watch, region_name)
+            except Exception as exc:  # noqa: BLE001 - one region should not block the others
+                errors.append(f"{region_name or '전체'}: {exc}")
+                continue
+            successful_searches += 1
+            for listing in self._parse_articles(articles):
+                results[listing.external_id] = listing
+
+        if successful_searches == 0 and errors:
+            raise RuntimeError("Daangn search failed: " + "; ".join(errors))
+        if errors:
+            print("[daangn] partial region failure: " + "; ".join(errors))
         return list(results.values())
 
     async def close(self) -> None:
