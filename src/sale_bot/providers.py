@@ -162,9 +162,16 @@ def _region_label(region: dict) -> str:
     return " > ".join(_region_parts(region))
 
 
+def _region_leaf(region: str) -> str:
+    tokens = [token for token in re.split(r"[\s>]+", region.strip()) if token]
+    return tokens[-1] if tokens else region.strip()
+
+
 def _select_region(requested: str, locations: list[dict]) -> dict:
     requested_norm = _norm_region(requested)
-    exact_paths = [item for item in locations if _norm_region(" ".join(_region_parts(item))) == requested_norm]
+    exact_paths = [
+        item for item in locations if _norm_region(" ".join(_region_parts(item))) == requested_norm
+    ]
     if len(exact_paths) == 1:
         return exact_paths[0]
 
@@ -173,7 +180,10 @@ def _select_region(requested: str, locations: list[dict]) -> dict:
         contextual = [
             item
             for item in locations
-            if all(_norm_region(token) in _norm_region(" ".join(_region_parts(item))) for token in requested_tokens)
+            if all(
+                _norm_region(token) in _norm_region(" ".join(_region_parts(item)))
+                for token in requested_tokens
+            )
         ]
         if len(contextual) == 1:
             return contextual[0]
@@ -181,10 +191,11 @@ def _select_region(requested: str, locations: list[dict]) -> dict:
             labels = ", ".join(_region_label(item) for item in contextual[:5])
             raise RuntimeError(f"Daangn region ambiguous: {requested} -> {labels}")
 
+    leaf_norm = _norm_region(_region_leaf(requested))
     leaf_exact = [
         item
         for item in locations
-        if requested_norm in {_norm_region(str(item.get(key) or "")) for key in ("name", "name3")}
+        if leaf_norm in {_norm_region(str(item.get(key) or "")) for key in ("name", "name3")}
     ]
     if len(leaf_exact) == 1:
         return leaf_exact[0]
@@ -212,7 +223,11 @@ class JoongnaProvider(Provider):
     name = "joongna"
 
     def __init__(self, timeout: int = 20):
-        self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor"})
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor"},
+        )
 
     async def search(self, watch: Watch) -> list[Listing]:
         url = f"https://web.joongna.com/search/{quote(watch.query)}"
@@ -227,13 +242,23 @@ class JoongnaProvider(Provider):
         for row in rows:
             seq = row.get("seq")
             title = row.get("title")
-            if seq is None or not title or (isinstance(row.get("state"), int) and row.get("state") != 0):
+            if seq is None or not title or (
+                isinstance(row.get("state"), int) and row.get("state") != 0
+            ):
                 continue
             locations = row.get("locationNames")
             location = row.get("mainLocationName")
             if not location and isinstance(locations, list) and locations:
                 location = locations[0]
-            listing = Listing("joongna", str(seq), str(title), coerce_price(row.get("price")), f"https://web.joongna.com/product/{seq}", location=str(location) if location else None, image_url=str(row.get("url")) if row.get("url") else None)
+            listing = Listing(
+                "joongna",
+                str(seq),
+                str(title),
+                coerce_price(row.get("price")),
+                f"https://web.joongna.com/product/{seq}",
+                location=str(location) if location else None,
+                image_url=str(row.get("url")) if row.get("url") else None,
+            )
             results.append((str(row.get("sortDate") or ""), listing))
         results.sort(key=lambda item: item[0], reverse=True)
         return [listing for _, listing in results]
@@ -250,7 +275,14 @@ class JoongnaProvider(Provider):
             image = anchor.find("img")
             title = (image.get("alt") if image else None) or text or "중고나라 매물"
             item_id = stable_id_from_url(full_url)
-            results[item_id] = Listing("joongna", item_id, str(title).strip(), parse_price(text), full_url, image_url=(image.get("src") if image else None))
+            results[item_id] = Listing(
+                "joongna",
+                item_id,
+                str(title).strip(),
+                parse_price(text),
+                full_url,
+                image_url=(image.get("src") if image else None),
+            )
         return list(results.values())
 
     async def close(self) -> None:
@@ -261,15 +293,25 @@ class DaangnProvider(Provider):
     name = "daangn"
 
     def __init__(self, timeout: int = 20):
-        self.client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor", "Accept": "application/json,text/html;q=0.9,*/*;q=0.8"})
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor",
+                "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+            },
+        )
         self._region_cache: dict[str, dict] = {}
 
     async def _resolve_region(self, region: str) -> dict:
         if region in self._region_cache:
             return self._region_cache[region]
-        response = await self.client.get("https://www.daangn.com/kr/api/v1/regions/keyword", params={"keyword": region})
+        response = await self.client.get(
+            "https://www.daangn.com/kr/api/v1/regions/keyword",
+            params={"keyword": _region_leaf(region)},
+        )
         response.raise_for_status()
-        locations = (response.json().get("locations") or [])
+        locations = response.json().get("locations") or []
         if not locations:
             raise RuntimeError(f"Daangn region not found: {region}")
         selected = _select_region(region, [item for item in locations if isinstance(item, dict)])
@@ -280,16 +322,27 @@ class DaangnProvider(Provider):
         explicit = [region for region in watch.daangn_regions if region != CHEONGJU_ALL]
         targets: list[str | None] = list(explicit)
         if CHEONGJU_ALL in watch.daangn_regions:
-            batch_count = max(1, min(int(getattr(watch, "daangn_batch_count", 5)), len(CHEONGJU_NEIGHBORHOODS)))
-            batch_index = int(getattr(watch, "daangn_batch_index", 0)) % batch_count
-            city_batch = [region for index, region in enumerate(CHEONGJU_NEIGHBORHOODS) if index % batch_count == batch_index]
+            batch_count = max(
+                1,
+                min(int(watch.daangn_batch_count), len(CHEONGJU_NEIGHBORHOODS)),
+            )
+            batch_index = int(watch.daangn_batch_index) % batch_count
+            city_batch = [
+                region
+                for index, region in enumerate(CHEONGJU_NEIGHBORHOODS)
+                if index % batch_count == batch_index
+            ]
             targets.extend(city_batch)
         if not targets:
             return [None]
         return list(dict.fromkeys(targets))
 
     async def _fetch_articles(self, watch: Watch, region_name: str | None) -> list[dict]:
-        params: dict[str, str] = {"search": watch.query, "only_on_sale": "true", "_data": "routes/kr.buy-sell._index"}
+        params: dict[str, str] = {
+            "search": watch.query,
+            "only_on_sale": "true",
+            "_data": "routes/kr.buy-sell._index",
+        }
         path = "/kr/buy-sell/"
         if region_name:
             region = await self._resolve_region(region_name)
@@ -318,7 +371,15 @@ class DaangnProvider(Provider):
             region_data = article.get("region")
             location = region_data.get("name") if isinstance(region_data, dict) else None
             image_url = article.get("imageUrl") or article.get("thumbnailUrl")
-            results[item_id] = Listing("daangn", item_id, str(title), coerce_price(article.get("price")), full_url, location=str(location) if location else None, image_url=str(image_url) if image_url else None)
+            results[item_id] = Listing(
+                "daangn",
+                item_id,
+                str(title),
+                coerce_price(article.get("price")),
+                full_url,
+                location=str(location) if location else None,
+                image_url=str(image_url) if image_url else None,
+            )
         return list(results.values())
 
     async def search(self, watch: Watch) -> list[Listing]:
@@ -328,7 +389,7 @@ class DaangnProvider(Provider):
         for region_name in self.region_targets(watch):
             try:
                 articles = await self._fetch_articles(watch, region_name)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - one region should not block others
                 errors.append(f"{region_name or '전체'}: {exc}")
                 continue
             successful_searches += 1
@@ -366,19 +427,36 @@ class BunjangProvider(Provider):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             try:
-                await page.wait_for_selector('a[href*="/products/"]', timeout=min(7000, self.timeout_ms))
+                await page.wait_for_selector(
+                    'a[href*="/products/"]', timeout=min(7000, self.timeout_ms)
+                )
             except PlaywrightTimeoutError:
                 body = (await page.locator("body").inner_text()).strip()
-                if body and any(word in body for word in ("검색 결과가 없습니다", "검색결과가 없습니다")):
+                if body and any(
+                    word in body for word in ("검색 결과가 없습니다", "검색결과가 없습니다")
+                ):
                     return []
-                raise RuntimeError("Bunjang search cards did not load; page structure or access may have changed")
-            cards = await page.locator('a[href*="/products/"]').evaluate_all("""
+                raise RuntimeError(
+                    "Bunjang search cards did not load; page structure or access may have changed"
+                )
+            cards = await page.locator('a[href*="/products/"]').evaluate_all(
+                """
                 els => els.map(a => {
-                  const texts = [...a.querySelectorAll('div,span,p')].map(n => (n.textContent || '').trim()).filter(Boolean);
-                  const priceText = texts.find(t => /^\\d{1,3}(,\\d{3})+\\s*원?$/.test(t)) || texts.find(t => /^\\d{4,}\\s*원$/.test(t)) || '';
-                  return {href: a.href, text: (a.innerText || '').trim(), title: a.querySelector('img')?.alt || texts[0] || '', priceText, image: a.querySelector('img')?.src || null};
+                  const texts = [...a.querySelectorAll('div,span,p')]
+                    .map(n => (n.textContent || '').trim())
+                    .filter(Boolean);
+                  const priceText = texts.find(t => /^\\d{1,3}(,\\d{3})+\\s*원?$/.test(t))
+                    || texts.find(t => /^\\d{4,}\\s*원$/.test(t)) || '';
+                  return {
+                    href: a.href,
+                    text: (a.innerText || '').trim(),
+                    title: a.querySelector('img')?.alt || texts[0] || '',
+                    priceText,
+                    image: a.querySelector('img')?.src || null
+                  };
                 })
-            """)
+                """
+            )
         finally:
             await page.close()
         results: dict[str, Listing] = {}
@@ -388,8 +466,17 @@ class BunjangProvider(Provider):
             if not match:
                 continue
             item_id = match.group(1)
-            price = parse_price(str(card.get("priceText") or "")) or parse_price(str(card.get("text") or ""))
-            results[item_id] = Listing("bunjang", item_id, str(card.get("title") or "번개장터 매물").strip(), price, href, image_url=str(card.get("image")) if card.get("image") else None)
+            price = parse_price(str(card.get("priceText") or ""))
+            if price is None:
+                price = parse_price(str(card.get("text") or ""))
+            results[item_id] = Listing(
+                "bunjang",
+                item_id,
+                str(card.get("title") or "번개장터 매물").strip(),
+                price,
+                href,
+                image_url=str(card.get("image")) if card.get("image") else None,
+            )
         return list(results.values())
 
     async def close(self) -> None:
@@ -402,4 +489,8 @@ class BunjangProvider(Provider):
 
 
 def build_providers(timeout: int) -> dict[str, Provider]:
-    return {"daangn": DaangnProvider(timeout), "joongna": JoongnaProvider(timeout), "bunjang": BunjangProvider(timeout)}
+    return {
+        "daangn": DaangnProvider(timeout),
+        "joongna": JoongnaProvider(timeout),
+        "bunjang": BunjangProvider(timeout),
+    }
