@@ -2,7 +2,10 @@ name: windows-test-copy
 
 on:
   push:
-    branches: [feature/windows-test-copy]
+    branches: [main]
+    paths:
+      - "sale_bot - sale test win/**"
+      - ".github/workflows/windows-test-copy.yml"
   pull_request:
     paths:
       - "sale_bot - sale test win/**"
@@ -19,14 +22,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install package
+      - name: Windows setup path
         shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-      - name: Ruff
+        run: .\win.ps1 setup
+      - name: Windows test path
         shell: pwsh
-        run: python -m ruff check src tests
-      - name: Pytest
-        shell: pwsh
-        run: python -m pytest -q
+        run: .\win.ps1 test
+      - name: SALE_TEST launcher smoke
+        shell: cmd
+        run: (echo 0) | call SALE_TEST.bat
