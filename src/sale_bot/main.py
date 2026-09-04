@@ -4,6 +4,7 @@ import os
 
 from .admin import run_discord_admin, run_telegram_admin
 from .config import Settings, load_settings
+from .models import Listing
 from .notifiers import Notifier, format_message
 from .providers import Provider, build_providers
 from .storage import Store
@@ -11,6 +12,22 @@ from .storage import Store
 
 def _db_path() -> str:
     return os.getenv("SALE_BOT_DB", "sale_bot.sqlite3")
+
+
+def _reserve_for_delivery(
+    store: Store,
+    watch_name: str,
+    listing: Listing,
+    *,
+    has_channels: bool,
+    suppress_bootstrap: bool,
+) -> bool:
+    if suppress_bootstrap:
+        store.reserve_alert(watch_name, listing)
+        return False
+    if not has_channels:
+        return False
+    return store.reserve_alert(watch_name, listing)
 
 
 async def _close_providers(providers: dict[str, Provider]) -> None:
@@ -53,9 +70,15 @@ async def run_cycle(settings: Settings) -> None:
                         continue
                     matched += 1
                     change = store.observe(listing)
-                    first_condition_match = store.reserve_alert(watch.name, listing)
                     suppress_bootstrap = settings.bootstrap_silently and not bootstrapped
-                    if first_condition_match and not suppress_bootstrap:
+                    should_alert = _reserve_for_delivery(
+                        store,
+                        watch.name,
+                        listing,
+                        has_channels=bool(channels),
+                        suppress_bootstrap=suppress_bootstrap,
+                    )
+                    if should_alert:
                         alerts += 1
                         await notifier.send(format_message(watch.name, listing, change))
 
