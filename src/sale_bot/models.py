@@ -47,10 +47,10 @@ class Watch:
     max_price: int | None = None
     exclude_keywords: list[str] = field(default_factory=list)
     providers: list[ProviderName] = field(default_factory=lambda: ["daangn", "joongna", "bunjang"])
-    # daangn_region is the legacy 0.3.x single TEXT/config key. Keep accepting it.
     daangn_region: str | None = None
-    # daangn_regions is the preferred config/runtime representation.
     daangn_regions: list[str] = field(default_factory=list)
+    daangn_batch_index: int = 0
+    daangn_batch_count: int = 5
 
     def __post_init__(self) -> None:
         merged = split_daangn_regions(self.daangn_regions)
