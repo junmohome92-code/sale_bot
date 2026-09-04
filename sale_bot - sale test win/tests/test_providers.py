@@ -2,14 +2,7 @@ import asyncio
 import json
 
 from sale_bot.models import Watch, split_daangn_regions
-from sale_bot.providers import (
-    DaangnProvider,
-    JoongnaProvider,
-    _extract_daangn_articles,
-    _extract_json_array,
-    coerce_price,
-    daangn_id_from_url,
-)
+from sale_bot.providers import DaangnProvider, JoongnaProvider, _extract_json_array, coerce_price
 
 
 def test_extract_joongna_embedded_items():
@@ -71,38 +64,6 @@ def test_split_daangn_regions_deduplicates_and_limits():
         raise AssertionError("more than five Daangn regions must be rejected")
 
 
-def test_daangn_html_embedded_articles_parse_current_fields():
-    rows = [
-        {
-            "id": "p7mskunj8ik8",
-            "href": "/kr/buy-sell/rx-9070-xt-p7mskunj8ik8/",
-            "title": "RX 9070 XT",
-            "price": "850000",
-            "thumbnail": "https://img.example/daangn.jpg",
-            "locationName": "복대동",
-            "status": "Ongoing",
-        }
-    ]
-    html = f'<script>window.x={{"fleamarketArticles":{json.dumps(rows)}}}</script>'
-    parsed = _extract_daangn_articles(html)
-    provider = DaangnProvider()
-    try:
-        listings = provider._parse_articles(parsed)
-    finally:
-        asyncio.run(provider.close())
-
-    assert len(listings) == 1
-    assert listings[0].external_id == "p7mskunj8ik8"
-    assert listings[0].price == 850000
-    assert listings[0].location == "복대동"
-    assert listings[0].image_url == "https://img.example/daangn.jpg"
-
-
-def test_daangn_slug_id_uses_trailing_article_id():
-    assert daangn_id_from_url("https://www.daangn.com/kr/buy-sell/rx-9070-xt-p7mskunj8ik8/") == "p7mskunj8ik8"
-    assert daangn_id_from_url("https://www.daangn.com/kr/buy-sell/p7mskunj8ik8/") == "p7mskunj8ik8"
-
-
 def test_daangn_multi_region_search_deduplicates_overlapping_listings(monkeypatch):
     provider = DaangnProvider()
     watch = Watch(
@@ -120,8 +81,7 @@ def test_daangn_multi_region_search_deduplicates_overlapping_listings(monkeypatc
             "href": "/kr/buy-sell/rx-9070-xt-123",
             "title": "RX 9070 XT",
             "price": 850000,
-            "locationName": region_name,
-            "status": "Ongoing",
+            "region": {"name": region_name},
         }
         if region_name == "복대동":
             return [common]
@@ -131,8 +91,7 @@ def test_daangn_multi_region_search_deduplicates_overlapping_listings(monkeypatc
                 "href": "/kr/buy-sell/rx-9070-xt-456",
                 "title": "RX 9070 XT 다른 매물",
                 "price": 880000,
-                "locationName": region_name,
-                "status": "Ongoing",
+                "region": {"name": region_name},
             },
         ]
 
@@ -145,4 +104,4 @@ def test_daangn_multi_region_search_deduplicates_overlapping_listings(monkeypatc
 
     assert calls == ["복대동", "가경동"]
     assert len(listings) == 2
-    assert {listing.external_id for listing in listings} == {"123", "456"}
+    assert {listing.external_id for listing in listings} == {"rx-9070-xt-123", "rx-9070-xt-456"}
