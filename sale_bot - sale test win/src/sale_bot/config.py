@@ -13,6 +13,7 @@ class Settings:
     alert_on_price_increase: bool
     bootstrap_silently: bool
     request_timeout_seconds: int
+    daangn_full_region_batches: int
     watches: list[Watch]
 
 
@@ -34,7 +35,7 @@ def load_settings(path: str | Path) -> Settings:
             raise ValueError(f"unknown provider(s) in {watch.name}: {sorted(invalid)}")
         if not watch.providers:
             raise ValueError(f"watch {watch.name} must contain at least one provider")
-        split_daangn_regions(watch.daangn_region)
+        split_daangn_regions(watch.daangn_regions)
         if (
             watch.min_price is not None
             and watch.max_price is not None
@@ -48,5 +49,6 @@ def load_settings(path: str | Path) -> Settings:
         alert_on_price_increase=bool(raw.get("alert_on_price_increase", False)),
         bootstrap_silently=bool(raw.get("bootstrap_silently", True)),
         request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
+        daangn_full_region_batches=max(1, min(10, int(raw.get("daangn_full_region_batches", 5)))),
         watches=watches,
     )

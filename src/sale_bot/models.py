@@ -4,19 +4,27 @@ from typing import Literal
 
 ProviderName = Literal["daangn", "joongna", "bunjang"]
 VALID_PROVIDERS = frozenset({"daangn", "joongna", "bunjang"})
-MAX_DAANGN_REGIONS = 5
+MAX_DAANGN_REGION_SPECS = 10
 
 
-def split_daangn_regions(value: str | None) -> list[str]:
+def split_daangn_regions(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
     if not value:
         return []
+
+    raw_parts: list[str] = []
+    if isinstance(value, str):
+        raw_parts.extend(re.split(r"[,;\n]+", value))
+    else:
+        for item in value:
+            raw_parts.extend(re.split(r"[,;\n]+", str(item)))
+
     regions: list[str] = []
-    for part in re.split(r"[,;\n]+", value):
+    for part in raw_parts:
         region = part.strip()
         if region and region not in regions:
             regions.append(region)
-    if len(regions) > MAX_DAANGN_REGIONS:
-        raise ValueError(f"Daangn region limit reached ({MAX_DAANGN_REGIONS})")
+    if len(regions) > MAX_DAANGN_REGION_SPECS:
+        raise ValueError(f"Daangn region limit reached ({MAX_DAANGN_REGION_SPECS})")
     return regions
 
 
@@ -40,10 +48,18 @@ class Watch:
     exclude_keywords: list[str] = field(default_factory=list)
     providers: list[ProviderName] = field(default_factory=lambda: ["daangn", "joongna", "bunjang"])
     daangn_region: str | None = None
+    daangn_regions: list[str] = field(default_factory=list)
+    daangn_batch_index: int = 0
+    daangn_batch_count: int = 5
 
-    @property
-    def daangn_regions(self) -> list[str]:
-        return split_daangn_regions(self.daangn_region)
+    def __post_init__(self) -> None:
+        merged = split_daangn_regions(self.daangn_regions)
+        for region in split_daangn_regions(self.daangn_region):
+            if region not in merged:
+                merged.append(region)
+        if len(merged) > MAX_DAANGN_REGION_SPECS:
+            raise ValueError(f"Daangn region limit reached ({MAX_DAANGN_REGION_SPECS})")
+        self.daangn_regions = merged
 
     def matches(self, listing: Listing) -> bool:
         title = listing.title.casefold()

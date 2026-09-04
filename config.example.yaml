@@ -4,6 +4,10 @@ alert_on_price_increase: false
 bootstrap_silently: true
 request_timeout_seconds: 20
 
+# "청주시 전체"는 43개 읍/면/동을 여러 batch로 나눠 순환합니다.
+# 기본값 5이면 polling 300초 기준 약 25분에 청주시 전체 1회전입니다.
+daangn_full_region_batches: 5
+
 watches:
   - name: "RX 9070 XT"
     query: "9070 xt"
@@ -17,5 +21,8 @@ watches:
       - daangn
       - joongna
       - bunjang
-    # 당근 지역은 쉼표로 최대 5개까지 지정 가능
-    daangn_region: "복대동, 가경동, 봉명동, 사창동"
+    daangn_regions:
+      - "청주시 전체"
+      # 동명이 겹치는 타지역은 시/구까지 포함한 전체 경로를 권장합니다.
+      - "대전광역시 유성구 봉명동"
+      - "세종특별자치시 조치원읍"
