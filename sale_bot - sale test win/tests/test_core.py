@@ -1,6 +1,7 @@
 import pytest
 
 from sale_bot.admin import handle_command
+from sale_bot.main import _reserve_for_delivery
 from sale_bot.models import Listing, Watch
 from sale_bot.notifiers import format_message
 from sale_bot.providers import parse_price
@@ -95,6 +96,38 @@ def test_alert_receipt_allows_each_listing_only_once(tmp_path):
         assert not reopened.reserve_alert("9070 XT", listing)
     finally:
         reopened.close()
+
+
+def test_no_channel_does_not_consume_active_alert(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
+    try:
+        assert not _reserve_for_delivery(
+            store,
+            "9070 XT",
+            listing,
+            has_channels=False,
+            suppress_bootstrap=False,
+        )
+        assert store.reserve_alert("9070 XT", listing)
+    finally:
+        store.close()
+
+
+def test_baseline_still_reserves_without_channel(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
+    try:
+        assert not _reserve_for_delivery(
+            store,
+            "9070 XT",
+            listing,
+            has_channels=False,
+            suppress_bootstrap=True,
+        )
+        assert not store.reserve_alert("9070 XT", listing)
+    finally:
+        store.close()
 
 
 def test_delete_watch_clears_bootstrap_and_alert_receipts(tmp_path):
