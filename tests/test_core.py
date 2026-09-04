@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from sale_bot.admin import handle_command
@@ -82,6 +84,34 @@ def test_exclude_keywords_are_configurable(tmp_path):
         store.close()
 
 
+def test_region_storage_reads_legacy_text_and_writes_json_list(tmp_path):
+    path = tmp_path / "sale.sqlite3"
+    store = Store(path)
+    try:
+        watch_id = store.add_watch("gpu", 900000, "복대동, 가경동")
+        assert store.list_watches()[0][1].daangn_regions == ["복대동", "가경동"]
+        assert store.set_region(watch_id, ["청주시 전체", "대전광역시 유성구 봉명동"])
+        assert store.list_watches()[0][1].daangn_regions == [
+            "청주시 전체",
+            "대전광역시 유성구 봉명동",
+        ]
+        store.conn.execute(
+            "UPDATE managed_watches SET daangn_region=? WHERE id=?", ("사창동, 우암동", watch_id)
+        )
+        store.conn.commit()
+        assert store.list_watches()[0][1].daangn_regions == ["사창동", "우암동"]
+    finally:
+        store.close()
+
+
+def test_daangn_rotation_cursor_persists(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    try:
+        assert [store.next_daangn_batch("gpu", 5) for _ in range(7)] == [0, 1, 2, 3, 4, 0, 1]
+    finally:
+        store.close()
+
+
 def test_alert_receipt_allows_each_listing_only_once(tmp_path):
     store = Store(tmp_path / "sale.sqlite3")
     listing = Listing("daangn", "abc", "9070 XT", 850000, "https://example.com/abc")
@@ -114,6 +144,22 @@ def test_no_channel_does_not_consume_active_alert(tmp_path):
         store.close()
 
 
+def test_active_delivery_is_not_reserved_before_send(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
+    try:
+        assert _reserve_for_delivery(
+            store,
+            "9070 XT",
+            listing,
+            has_channels=True,
+            suppress_bootstrap=False,
+        )
+        assert not store.has_alert_receipt("9070 XT", listing)
+    finally:
+        store.close()
+
+
 def test_baseline_still_reserves_without_channel(tmp_path):
     store = Store(tmp_path / "sale.sqlite3")
     listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
@@ -128,6 +174,33 @@ def test_baseline_still_reserves_without_channel(tmp_path):
         assert not store.reserve_alert("9070 XT", listing)
     finally:
         store.close()
+
+
+def test_upgrade_guard_backfills_matching_existing_listings(tmp_path):
+    path = tmp_path / "sale.sqlite3"
+    store = Store(path)
+    matching = Listing("joongna", "match", "9070 XT 판매", 850000, "https://example/match")
+    expensive = Listing("joongna", "high", "9070 XT 판매", 1200000, "https://example/high")
+    try:
+        store.add_watch("9070 XT", 900000)
+        store.observe(matching)
+        store.observe(expensive)
+        store.mark_bootstrapped("9070 XT", "joongna")
+    finally:
+        store.close()
+
+    conn = sqlite3.connect(path)
+    conn.execute("DELETE FROM alert_receipts")
+    conn.execute("DELETE FROM app_state WHERE key='alert_receipts_upgrade_guard_v1'")
+    conn.commit()
+    conn.close()
+
+    upgraded = Store(path)
+    try:
+        assert upgraded.has_alert_receipt("9070 XT", matching)
+        assert not upgraded.has_alert_receipt("9070 XT", expensive)
+    finally:
+        upgraded.close()
 
 
 def test_delete_watch_clears_bootstrap_and_alert_receipts(tmp_path):
@@ -172,3 +245,14 @@ def test_chat_command_slot_limit_and_exclude(tmp_path, monkeypatch):
     listing = handle_command("/list")
     assert "3/3" in listing
     assert "삽니다" in listing
+
+
+def test_chat_region_accepts_citywide_plus_specific_area(tmp_path, monkeypatch):
+    db_path = tmp_path / "commands.sqlite3"
+    monkeypatch.setenv("SALE_BOT_DB", str(db_path))
+    assert "추가 완료" in handle_command(
+        "/add GPU | 900000 | 청주시 전체, 대전광역시 유성구 봉명동"
+    )
+    listing = handle_command("/list")
+    assert "청주시 전체" in listing
+    assert "대전광역시 유성구 봉명동" in listing
