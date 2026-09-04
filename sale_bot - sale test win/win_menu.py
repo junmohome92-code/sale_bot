@@ -4,6 +4,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+DB_FILES = (
+    ROOT / "data" / "sale_bot-win.sqlite3",
+    ROOT / "data" / "sale_bot-win.sqlite3-shm",
+    ROOT / "data" / "sale_bot-win.sqlite3-wal",
+)
 
 
 def run_ps(action: str) -> None:
@@ -28,6 +33,18 @@ def open_file(path: Path, source: Path) -> None:
     os.startfile(path)
 
 
+def reset_test_db() -> None:
+    deleted = False
+    for path in DB_FILES:
+        if path.exists():
+            path.unlink()
+            deleted = True
+    if deleted:
+        print("Windows 테스트 DB를 초기화했습니다.")
+    else:
+        print("초기화할 Windows 테스트 DB가 없습니다.")
+
+
 def main() -> None:
     os.chdir(ROOT)
     while True:
@@ -42,6 +59,7 @@ def main() -> None:
         print("  4. 계속 실행")
         print("  5. 검색 설정 열기 (config.yaml)")
         print("  6. 텔레그램/디스코드 설정 열기 (.env)")
+        print("  7. Windows 테스트 DB 초기화")
         print("  0. 종료")
         print()
         choice = input("번호를 선택하세요: ").strip()
@@ -60,6 +78,8 @@ def main() -> None:
         elif choice == "6":
             open_file(ROOT / ".env", ROOT / ".env.example")
             continue
+        elif choice == "7":
+            reset_test_db()
         elif choice == "0":
             return
         else:
