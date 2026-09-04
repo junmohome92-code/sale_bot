@@ -7,16 +7,25 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 function Invoke-SystemPython {
-    param([string[]]$Args)
+    param([string[]]$PythonArgs)
+
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3.12 @Args
+        & py -3.12 @PythonArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python command failed with exit code $LASTEXITCODE"
+        }
         return
     }
+
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        & python @Args
+        & python @PythonArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python command failed with exit code $LASTEXITCODE"
+        }
         return
     }
-    throw "Python 3.12+ is required. Install Python and re-run: .\\win.ps1 setup"
+
+    throw "Python 3.12+ is required. Install Python and run setup again."
 }
 
 function Import-DotEnv {
@@ -47,7 +56,11 @@ function Ensure-LocalFiles {
 function Ensure-Venv {
     if (-not (Test-Path ".venv\\Scripts\\python.exe")) {
         Write-Host "Creating .venv ..."
-        Invoke-SystemPython -Args @("-m", "venv", ".venv")
+        Invoke-SystemPython -PythonArgs @("-m", "venv", ".venv")
+    }
+
+    if (-not (Test-Path ".venv\\Scripts\\python.exe")) {
+        throw "Virtual environment creation failed."
     }
 }
 
@@ -56,15 +69,18 @@ function Setup {
     Ensure-Venv
     $python = Join-Path $PSScriptRoot ".venv\\Scripts\\python.exe"
     & $python -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m pip install -e ".[dev]"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m playwright install chromium
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host "Windows setup complete."
 }
 
 function Prepare-Runtime {
     Ensure-LocalFiles
     if (-not (Test-Path ".venv\\Scripts\\python.exe")) {
-        throw "Virtual environment not found. Run: .\\win.ps1 setup"
+        throw "Virtual environment not found. Run setup first."
     }
     Import-DotEnv ".env"
     $env:SALE_BOT_CONFIG = (Join-Path $PSScriptRoot "config.yaml")
