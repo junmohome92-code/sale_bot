@@ -27,6 +27,18 @@ def run_ps(action: str) -> None:
     )
 
 
+def run_daangn_diag() -> None:
+    python_exe = ROOT / ".venv" / "Scripts" / "python.exe"
+    if not python_exe.exists():
+        print("먼저 1번 '최초 설치'를 실행해주세요.")
+        return
+    subprocess.run(
+        [str(python_exe), str(ROOT / "daangn_diag.py")],
+        cwd=ROOT,
+        check=False,
+    )
+
+
 def open_file(path: Path, source: Path) -> None:
     if not path.exists():
         path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
@@ -60,6 +72,7 @@ def main() -> None:
         print("  5. 검색 설정 열기 (config.yaml)")
         print("  6. 텔레그램/디스코드 설정 열기 (.env)")
         print("  7. Windows 테스트 DB 초기화")
+        print("  8. 당근 지역/검색 진단")
         print("  0. 종료")
         print()
         choice = input("번호를 선택하세요: ").strip()
@@ -80,6 +93,8 @@ def main() -> None:
             continue
         elif choice == "7":
             reset_test_db()
+        elif choice == "8":
+            run_daangn_diag()
         elif choice == "0":
             return
         else:
