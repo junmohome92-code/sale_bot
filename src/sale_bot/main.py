@@ -6,7 +6,7 @@ from .admin import run_discord_admin, run_telegram_admin
 from .config import Settings, load_settings
 from .models import Listing
 from .notifiers import Notifier, format_message
-from .providers import Provider, build_providers
+from .providers import CHEONGJU_ALL, Provider, build_providers
 from .storage import Store
 
 
@@ -27,7 +27,7 @@ def _reserve_for_delivery(
         return False
     if not has_channels:
         return False
-    return store.reserve_alert(watch_name, listing)
+    return not store.has_alert_receipt(watch_name, listing)
 
 
 async def _close_providers(providers: dict[str, Provider]) -> None:
@@ -36,6 +36,14 @@ async def _close_providers(providers: dict[str, Provider]) -> None:
             await provider.close()
         except Exception as exc:  # noqa: BLE001 - cleanup must not stop daemon shutdown
             print(f"[{provider.name}] close failed: {exc}")
+
+
+def _bootstrap_key(store: Store, watch, provider_name: str, settings: Settings) -> str:
+    if provider_name != "daangn" or CHEONGJU_ALL not in watch.daangn_regions:
+        return provider_name
+    watch.daangn_batch_count = settings.daangn_full_region_batches
+    watch.daangn_batch_index = store.next_daangn_batch(watch.name, watch.daangn_batch_count)
+    return f"daangn:batch:{watch.daangn_batch_index}"
 
 
 async def run_cycle(settings: Settings) -> None:
@@ -56,7 +64,11 @@ async def run_cycle(settings: Settings) -> None:
         for _, watch, _ in managed:
             for provider_name in watch.providers:
                 provider = providers[provider_name]
-                bootstrapped = store.is_bootstrapped(watch.name, provider_name)
+                bootstrap_key = _bootstrap_key(store, watch, provider_name, settings)
+                bootstrapped = store.is_bootstrapped(watch.name, bootstrap_key)
+                # Existing pre-batch installations used the plain daangn key.
+                if provider_name == "daangn" and not bootstrapped:
+                    bootstrapped = store.is_bootstrapped(watch.name, "daangn")
                 try:
                     listings = await provider.search(watch)
                 except Exception as exc:  # noqa: BLE001 - one provider must not stop other scans
@@ -71,22 +83,26 @@ async def run_cycle(settings: Settings) -> None:
                     matched += 1
                     change = store.observe(listing)
                     suppress_bootstrap = settings.bootstrap_silently and not bootstrapped
-                    should_alert = _reserve_for_delivery(
+                    should_deliver = _reserve_for_delivery(
                         store,
                         watch.name,
                         listing,
                         has_channels=bool(channels),
                         suppress_bootstrap=suppress_bootstrap,
                     )
-                    if should_alert:
-                        alerts += 1
-                        await notifier.send(format_message(watch.name, listing, change))
+                    if should_deliver:
+                        delivered = await notifier.send(format_message(watch.name, listing, change))
+                        if delivered and store.reserve_alert(watch.name, listing):
+                            alerts += 1
 
-                store.mark_bootstrapped(watch.name, provider_name)
+                store.mark_bootstrapped(watch.name, bootstrap_key)
                 mode = "baseline" if settings.bootstrap_silently and not bootstrapped else "active"
+                batch = ""
+                if provider_name == "daangn" and CHEONGJU_ALL in watch.daangn_regions:
+                    batch = f" batch={watch.daangn_batch_index + 1}/{watch.daangn_batch_count}"
                 print(
                     f"[{provider_name}] {watch.name}: fetched={len(listings)} "
-                    f"matched={matched} alerts={alerts} mode={mode}"
+                    f"matched={matched} alerts={alerts} mode={mode}{batch}"
                 )
     finally:
         await _close_providers(providers)
