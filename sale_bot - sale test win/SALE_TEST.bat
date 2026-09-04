@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 title sale_bot - sale test win
@@ -6,18 +7,18 @@ title sale_bot - sale test win
 :menu
 cls
 echo ========================================
-echo   sale_bot - sale test win
- echo ========================================
+echo        sale_bot - sale test win
+echo ========================================
 echo.
-echo   1. First setup
- echo   2. Run code tests
- echo   3. Run one marketplace scan
- echo   4. Run continuously
- echo   5. Open config.yaml
- echo   6. Open .env
- echo   0. Exit
- echo.
-set /p choice=Select: 
+echo   1. 최초 설치
+echo   2. 코드 테스트
+echo   3. 중고마켓 실제 검색 1회
+echo   4. 계속 실행
+echo   5. 검색 설정 열기 ^(config.yaml^)
+echo   6. 텔레그램/디스코드 설정 열기 ^(.env^)
+echo   0. 종료
+echo.
+set /p choice=번호를 선택하세요: 
 
 if "%choice%"=="1" goto setup
 if "%choice%"=="2" goto test
@@ -57,7 +58,7 @@ goto menu
 :done
 echo.
 echo ========================================
-echo Finished. Press any key to return to menu.
+echo 작업이 끝났습니다. 아무 키나 누르면 메뉴로 돌아갑니다.
 echo ========================================
 pause >nul
 goto menu
