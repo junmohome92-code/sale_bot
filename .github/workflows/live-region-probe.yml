@@ -1,0 +1,22 @@
+name: live-region-probe
+
+on:
+  push:
+    branches:
+      - fix/market-region-and-price-floor
+    paths:
+      - tools/live_region_probe.py
+      - .github/workflows/live-region-probe.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright
+      - run: playwright install --with-deps chromium
+      - run: python tools/live_region_probe.py
