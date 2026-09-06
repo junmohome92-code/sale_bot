@@ -69,9 +69,10 @@ function Setup {
     Ensure-LocalFiles
     Ensure-Venv
     $python = Join-Path $PSScriptRoot ".venv\\Scripts\\python.exe"
+    $editable = "${RepoRoot}[dev]"
     & $python -m pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & $python -m pip install -e "$RepoRoot[dev]"
+    & $python -m pip install -e $editable
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m playwright install chromium
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
