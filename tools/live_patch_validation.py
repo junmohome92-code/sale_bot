@@ -41,28 +41,6 @@ async def check(name, provider):
         await provider.close()
 
 
-def walk_keys(value, path=""):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            here = f"{path}.{key}" if path else key
-            low = key.lower()
-            if any(token in low for token in ("loc", "region", "area", "filter", "town", "dong")):
-                if isinstance(child, (str, int, float, bool)) or child is None:
-                    preview = child
-                elif isinstance(child, list):
-                    preview = f"list[{len(child)}]"
-                elif isinstance(child, dict):
-                    preview = f"dict[{len(child)}]"
-                else:
-                    preview = type(child).__name__
-                print("KEY", here, "=", preview)
-            if path.count(".") < 4 and key not in {"items", "products", "list", "productList"}:
-                walk_keys(child, here)
-    elif isinstance(value, list):
-        for index, child in enumerate(value[:3]):
-            walk_keys(child, f"{path}[{index}]")
-
-
 async def inspect_joongna_contract():
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=HEADERS) as client:
         body = {
@@ -81,9 +59,15 @@ async def inspect_joongna_contract():
         )
         print("JOONGNA API STATUS", response.status_code)
         payload = response.json()
+        data = payload.get("data") or {}
         print("TOP_KEYS", list(payload.keys()))
-        print("DATA_KEYS", list((payload.get("data") or {}).keys()))
-        walk_keys(payload)
+        print("DATA_KEYS", list(data.keys()))
+        filter_blob = json.dumps(data.get("filter"), ensure_ascii=False, indent=2)
+        print("FILTER_JSON_BEGIN")
+        print(filter_blob[:30000])
+        print("FILTER_JSON_END")
+        search_component = json.dumps(data.get("searchFilterComponent"), ensure_ascii=False, indent=2)
+        print("SEARCH_FILTER_COMPONENT", search_component[:10000])
 
         page_url = f"https://web.joongna.com/search/{quote('닌텐도 스위치2')}"
         html_response = await client.get(page_url)
@@ -96,7 +80,6 @@ async def inspect_joongna_contract():
             "locationFilter",
             "regionFilter",
             "filterLocation",
-            "town",
             "우리동네",
         )
         hits = 0
@@ -112,7 +95,12 @@ async def inspect_joongna_contract():
                     idx = text.find(needle, start)
                     if idx < 0:
                         break
-                    print("JS_HIT", needle, src, text[max(0, idx - 500) : idx + 900].replace("\n", " "))
+                    print(
+                        "JS_HIT",
+                        needle,
+                        src,
+                        text[max(0, idx - 500) : idx + 900].replace("\n", " "),
+                    )
                     hits += 1
                     if hits >= 40:
                         return
