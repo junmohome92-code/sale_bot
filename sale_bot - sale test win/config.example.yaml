@@ -4,13 +4,13 @@ alert_on_price_increase: false
 bootstrap_silently: true
 request_timeout_seconds: 20
 
-# "청주시 전체"는 43개 읍/면/동을 여러 batch로 나눠 순환합니다.
-# 기본값 5이면 polling 300초 기준 약 25분에 청주시 전체 1회전입니다.
-daangn_full_region_batches: 5
+# "OO시 전체", "OO구 전체" 같은 넓은 당근 지역을 몇 개 batch로 나눌지 설정합니다.
+# 예: 5면 각 polling cycle마다 전체 하위지역의 약 1/5씩 검색합니다.
+daangn_region_batches: 5
 
 watches:
-  - name: "RX 9070 XT"
-    query: "9070 xt"
+  - name: "닌텐도스위치2"
+    query: "닌텐도스위치2"
     min_price: 500000
     max_price: 1200000
     exclude_keywords:
@@ -22,7 +22,10 @@ watches:
       - joongna
       - bunjang
     daangn_regions:
+      # 특정 도시/구 전체는 코드 하드코딩이 아니라 당근의 현재 region 계층을 자동 발견합니다.
       - "청주시 전체"
-      # 동명이 겹치는 타지역은 시/구까지 포함한 전체 경로를 권장합니다.
-      - "대전광역시 유성구 봉명동"
-      - "세종특별자치시 조치원읍"
+      # 아래처럼 다른 도시도 같은 방식으로 지정할 수 있습니다.
+      # - "대전시 전체"
+      # - "경기도 성남시 전체"
+      # 개별 동명이 겹칠 때는 시/구까지 포함한 전체 경로를 권장합니다.
+      # - "대전광역시 유성구 봉명동"
