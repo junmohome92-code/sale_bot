@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import re
 from dataclasses import replace
@@ -6,7 +7,7 @@ from pathlib import Path
 import yaml
 
 from sale_bot.models import Watch
-from sale_bot.providers import CHEONGJU_ALL, CHEONGJU_NEIGHBORHOODS, DaangnProvider
+from sale_bot.providers import DaangnProvider, daangn_all_scope
 
 ROOT = Path(__file__).resolve().parent
 
@@ -32,7 +33,11 @@ def _load_watch_and_batches() -> tuple[Watch, int]:
     watches = raw.get("watches") or []
     for item in watches:
         if "daangn" in (item.get("providers") or []):
-            batches = max(1, min(10, int(raw.get("daangn_full_region_batches", 5))))
+            raw_batches = raw.get(
+                "daangn_region_batches",
+                raw.get("daangn_full_region_batches", 5),
+            )
+            batches = max(1, min(20, int(raw_batches)))
             return Watch(**item), batches
     raise RuntimeError("config.yaml에서 daangn provider가 포함된 감시 항목을 찾지 못했습니다.")
 
@@ -46,44 +51,83 @@ def _resolved_label(region: dict) -> str:
     return " > ".join(parts) or "(이름 없음)"
 
 
-async def main() -> None:
+def _print_scope_summary(provider: DaangnProvider) -> None:
+    if not provider.last_scope_expansions:
+        return
+    print("[0] '전체' 지역 자동 확장 결과")
+    for spec, labels in provider.last_scope_expansions.items():
+        groups = sorted(
+            {
+                " / ".join(label.split(" ")[:-1])
+                for label in labels
+                if len(label.split(" ")) >= 2
+            }
+        )
+        print(f"- {spec}: 당근 검색 가능 하위지역 {len(labels)}개")
+        if groups:
+            preview = ", ".join(groups[:8])
+            suffix = " ..." if len(groups) > 8 else ""
+            print(f"  상위 지역: {preview}{suffix}")
+    print()
+
+
+async def main(*, all_regions: bool = False) -> None:
     watch, batch_count = _load_watch_and_batches()
     watch.daangn_batch_count = batch_count
     watch.daangn_batch_index = 0
-    regions = watch.daangn_regions
     provider = DaangnProvider(timeout=20)
-    targets = provider.region_targets(watch)
 
     print("=" * 62)
-    print("당근 진단 - DB/알림에는 아무것도 기록하지 않습니다.")
+    if all_regions:
+        print("당근 전체지역 검증 - 검색 매물/DB/알림에는 아무것도 기록하지 않습니다.")
+    else:
+        print("당근 진단 - DB/알림에는 아무것도 기록하지 않습니다.")
     print("=" * 62)
     print(f"감시명: {watch.name}")
     print(f"기본 검색어: {watch.query}")
-    print(f"설정 지역: {', '.join(regions) if regions else '미지정'}")
-    if CHEONGJU_ALL in regions:
-        print(
-            f"청주시 전체: {len(CHEONGJU_NEIGHBORHOODS)}개 읍/면/동을 "
-            f"{batch_count}개 batch로 순환"
-        )
-        print("진단에서는 요청량을 줄이기 위해 batch 1만 검사합니다.")
+    print(f"설정 지역: {', '.join(watch.daangn_regions) if watch.daangn_regions else '미지정'}")
+
+    broad_specs = [region for region in watch.daangn_regions if daangn_all_scope(region)]
+    if broad_specs:
+        print(f"'전체' 지역은 {batch_count}개 batch로 나눠 순환합니다.")
+        if not all_regions:
+            print("이번 진단에서는 batch 1만 실제 검색합니다.")
     print()
 
     try:
-        if targets != [None]:
-            print("[1] 이번 진단 대상 지역 해석 결과")
-            for requested in targets:
-                if requested is None:
-                    continue
-                try:
-                    resolved = await provider._resolve_region(requested)
-                except Exception as exc:  # noqa: BLE001 - diagnostic should continue
-                    print(f"- 요청={requested} -> ERROR: {exc}")
-                    continue
-                print(
-                    f"- 요청={requested} -> {_resolved_label(resolved)} "
-                    f"| id={resolved.get('id')} depth={resolved.get('depth')}"
-                )
-            print()
+        targets = (
+            await provider.all_region_targets(watch)
+            if all_regions
+            else await provider.region_targets(watch)
+        )
+        _print_scope_summary(provider)
+
+        print("[1] 지역 해석 결과")
+        errors = 0
+        for requested in targets:
+            if requested is None:
+                print("- 지역 미지정")
+                continue
+            try:
+                resolved = await provider._resolve_region(requested)
+            except Exception as exc:  # noqa: BLE001 - diagnostic should continue
+                errors += 1
+                print(f"- 요청={requested} -> ERROR: {exc}")
+                continue
+            print(
+                f"- 요청={requested} -> {_resolved_label(resolved)} "
+                f"| id={resolved.get('id')} depth={resolved.get('depth')}"
+            )
+        print()
+
+        if all_regions:
+            print("[2] 전체지역 검증 요약")
+            print(f"- 대상={len(targets)} / 성공={len(targets) - errors} / 오류={errors}")
+            if errors:
+                print("- 오류가 있으면 해당 지역명을 그대로 보내주세요.")
+            else:
+                print("- 현재 발견된 전체 하위지역이 모두 당근 region id로 정상 해석됩니다.")
+            return
 
         print("[2] 검색어별 raw 결과")
         for query in _query_variants(watch.query):
@@ -112,13 +156,17 @@ async def main() -> None:
             print(f"  합계(raw, 지역 중복 포함): {total}")
 
         print("\n[3] 참고")
-        print("- '청주시 전체'는 실제 계속 실행에서 batch가 매 cycle 순환합니다.")
-        print("- 단순 동명이 여러 후보면 자동 첫 후보 선택 대신 ambiguous 오류가 납니다.")
-        print("- 타지역 동명이 있으면 '대전광역시 유성구 봉명동'처럼 전체 경로를 쓰세요.")
-        print("- 기본 검색어만 0이고 다른 검색어가 나오면 검색어 문제입니다.")
+        print("- 'OO시 전체', 'OO구 전체'는 당근의 현재 지역 계층을 자동 발견합니다.")
+        print("- 실제 계속 실행에서는 설정된 batch가 매 cycle 순환합니다.")
+        print("- 동명이 여러 후보면 자동 첫 후보 선택 대신 ambiguous 오류가 납니다.")
+        print("- 개별 동명이 겹치면 '대전광역시 유성구 봉명동'처럼 전체 경로를 쓰세요.")
+        print("- 메뉴의 전체지역 검증은 매물 검색 없이 지역 해석만 전수 확인합니다.")
     finally:
         await provider.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--all-regions", action="store_true")
+    args = parser.parse_args()
+    asyncio.run(main(all_regions=args.all_regions))
