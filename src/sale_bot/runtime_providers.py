@@ -247,7 +247,7 @@ class JoongnaRuntimeProvider(Provider):
                 response = await self.client.post(JOONGNA_SEARCH_API, json=body)
                 response.raise_for_status()
                 rows = self._rows(response.json())
-            except Exception as exc:  # noqa: BLE001 - preserve earlier pages on partial outage
+            except Exception as exc:
                 self.last_search_complete = False
                 self.last_search_errors.append(f"page {page}: {exc}")
                 if not results:
@@ -323,7 +323,7 @@ class BunjangRuntimeProvider(Provider):
                 rows = payload.get("list") or []
                 if not isinstance(rows, list):
                     raise TypeError("Bunjang search payload shape changed: list missing")
-            except Exception as exc:  # noqa: BLE001 - preserve earlier pages on partial outage
+            except Exception as exc:
                 self.last_search_complete = False
                 self.last_search_errors.append(f"page {page}: {exc}")
                 if not results:
