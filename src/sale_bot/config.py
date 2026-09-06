@@ -9,24 +9,15 @@ from .models import VALID_PROVIDERS, Watch, split_daangn_regions
 @dataclass(slots=True)
 class Settings:
     poll_interval_seconds: int
-    alert_on_first_seen: bool
-    alert_on_price_increase: bool
-    bootstrap_silently: bool
     request_timeout_seconds: int
-    daangn_region_batches: int
     watches: list[Watch]
-
-    @property
-    def daangn_full_region_batches(self) -> int:
-        """Backward-compatible name used by older code/config docs."""
-        return self.daangn_region_batches
 
 
 def load_settings(path: str | Path) -> Settings:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    config_path = Path(path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    raw = raw or {}
     watches = [Watch(**item) for item in raw.get("watches", [])]
-    if not watches:
-        raise ValueError("config must contain at least one watch")
 
     names = [watch.name for watch in watches]
     if len(names) != len(set(names)):
@@ -48,16 +39,8 @@ def load_settings(path: str | Path) -> Settings:
         if watch.min_price is not None and watch.min_price > watch.max_price:
             raise ValueError(f"watch {watch.name}: min_price cannot exceed max_price")
 
-    batch_value = raw.get(
-        "daangn_region_batches",
-        raw.get("daangn_full_region_batches", 5),
-    )
     return Settings(
         poll_interval_seconds=max(60, int(raw.get("poll_interval_seconds", 300))),
-        alert_on_first_seen=bool(raw.get("alert_on_first_seen", True)),
-        alert_on_price_increase=bool(raw.get("alert_on_price_increase", False)),
-        bootstrap_silently=bool(raw.get("bootstrap_silently", True)),
         request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
-        daangn_region_batches=max(1, min(20, int(batch_value))),
         watches=watches,
     )
