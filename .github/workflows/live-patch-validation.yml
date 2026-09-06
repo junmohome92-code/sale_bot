@@ -1,0 +1,21 @@
+name: live-patch-validation
+
+on:
+  push:
+    branches:
+      - fix/market-region-and-price-floor
+    paths:
+      - tools/live_patch_validation.py
+      - .github/workflows/live-patch-validation.yml
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e .
+      - run: python tools/live_patch_validation.py
