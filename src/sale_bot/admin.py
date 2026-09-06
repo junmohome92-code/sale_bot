@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import httpx
 
 from .config import load_settings
-from .models import MAX_DAANGN_REGION_SPECS, Watch, split_daangn_regions
+from .models import Watch, split_daangn_regions
 from .region_policy import market_city_text
 from .runtime_control import (
     ALLOWED_POLL_INTERVALS,
