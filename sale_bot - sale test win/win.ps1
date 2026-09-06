@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $PSScriptRoot
 
 function Invoke-SystemPython {
@@ -41,12 +42,12 @@ function Import-DotEnv {
 
 function Ensure-LocalFiles {
     if (-not (Test-Path "config.yaml")) {
-        Copy-Item "config.example.yaml" "config.yaml"
-        Write-Host "Created config.yaml from config.example.yaml"
+        Copy-Item (Join-Path $RepoRoot "config.example.yaml") "config.yaml"
+        Write-Host "Created config.yaml from root config.example.yaml"
     }
     if (-not (Test-Path ".env")) {
-        Copy-Item ".env.example" ".env"
-        Write-Host "Created .env from .env.example"
+        Copy-Item (Join-Path $RepoRoot ".env.example") ".env"
+        Write-Host "Created .env from root .env.example"
     }
     if (-not (Test-Path "data")) {
         New-Item -ItemType Directory -Path "data" | Out-Null
@@ -70,11 +71,11 @@ function Setup {
     $python = Join-Path $PSScriptRoot ".venv\\Scripts\\python.exe"
     & $python -m pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & $python -m pip install -e ".[dev]"
+    & $python -m pip install -e "$RepoRoot[dev]"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m playwright install chromium
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "Windows setup complete."
+    Write-Host "Windows setup complete. Root source is installed editable."
 }
 
 function Prepare-Runtime {
@@ -94,9 +95,9 @@ switch ($Action) {
     "test" {
         Prepare-Runtime
         $python = Join-Path $PSScriptRoot ".venv\\Scripts\\python.exe"
-        & $python -m ruff check src tests
+        & $python -m ruff check (Join-Path $RepoRoot "src") (Join-Path $RepoRoot "tests")
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        & $python -m pytest -q
+        & $python -m pytest -q (Join-Path $RepoRoot "tests")
         exit $LASTEXITCODE
     }
     "once" {
