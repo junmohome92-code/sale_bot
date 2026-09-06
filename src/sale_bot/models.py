@@ -44,6 +44,7 @@ class Watch:
     query: str
     min_price: int | None = None
     max_price: int | None = None
+    ignore_price_at_or_below: int = 0
     exclude_keywords: list[str] = field(default_factory=list)
     providers: list[ProviderName] = field(default_factory=lambda: ["daangn", "joongna", "bunjang"])
     daangn_region: str | None = None
@@ -53,6 +54,8 @@ class Watch:
     daangn_batch_count: int = 5
 
     def __post_init__(self) -> None:
+        if self.ignore_price_at_or_below < 0:
+            raise ValueError("ignore_price_at_or_below cannot be negative")
         merged = split_daangn_regions(self.daangn_regions)
         for region in split_daangn_regions(self.daangn_region):
             if region not in merged:
@@ -67,6 +70,8 @@ class Watch:
             return False
         if listing.price is None:
             return self.min_price is None and self.max_price is None
+        if self.ignore_price_at_or_below and listing.price <= self.ignore_price_at_or_below:
+            return False
         if self.min_price is not None and listing.price < self.min_price:
             return False
         return self.max_price is None or listing.price <= self.max_price

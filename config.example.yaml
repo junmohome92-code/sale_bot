@@ -13,6 +13,7 @@ watches: []
 #   - name: "RX 9070 XT"
 #     query: "RX 9070 XT"
 #     max_price: 1000000
+#     ignore_price_at_or_below: 10000
 #     exclude_keywords:
 #       - "삽니다"
 #       - "구매"

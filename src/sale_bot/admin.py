@@ -29,6 +29,7 @@ HELP_TEXT = f"""🛒 sale_bot 도움말
 • 첫 검색에서 조건에 맞는 기존 매물도 링크와 함께 보여줌
 • 이후 새 조건충족 매물 / 실제 가격 하락 시 알림
 • 같은 가격 반복 / 가격 상승은 알림 없음
+• 슬롯별로 'N원 이하 무시' 가격을 설정할 수 있음
 
 📍 지역 정책
 • 당근: 입력한 시/구/동 범위를 그대로 적용
@@ -107,6 +108,18 @@ def _parse_price_spec(value: str) -> tuple[int | None, int]:
     if minimum < 0 or maximum <= 0 or minimum > maximum:
         raise ValueError("invalid price range")
     return minimum, maximum
+
+
+def _parse_nonnegative_price(value: str) -> int:
+    cleaned = value.replace(",", "").replace("원", "").strip()
+    parsed = int(cleaned)
+    if parsed < 0:
+        raise ValueError("price cannot be negative")
+    return parsed
+
+
+def _format_ignore_price(value: int) -> str:
+    return "사용 안 함" if value <= 0 else f"{value:,}원 이하 무시"
 
 
 def _format_price_range(min_price: int | None, max_price: int | None) -> str:
@@ -260,6 +273,7 @@ def _list_text(store: Store) -> str:
         lines.append(
             f"#{watch_id} {status} {watch.name}\n"
             f"  💰 {_format_price_range(watch.min_price, watch.max_price)}\n"
+            f"  🚫 무시가격: {_format_ignore_price(watch.ignore_price_at_or_below)}\n"
             f"  📍 당근: {daangn_region}\n"
             f"  🏙 중고나라/번개: {market_city_text(watch)}"
         )
@@ -323,8 +337,9 @@ def _watch_keyboard(watch_id: int, enabled: bool) -> dict:
         "inline_keyboard": [
             [
                 {"text": "💰 가격 변경", "callback_data": f"watch:price:{watch_id}"},
-                {"text": "📍 지역 변경", "callback_data": f"watch:region:{watch_id}"},
+                {"text": "🚫 무시가격", "callback_data": f"watch:ignore:{watch_id}"},
             ],
+            [{"text": "📍 지역 변경", "callback_data": f"watch:region:{watch_id}"}],
             [{"text": toggle_text, "callback_data": f"watch:{toggle}:{watch_id}"}],
             [{"text": "🗑 삭제", "callback_data": f"watch:deleteask:{watch_id}"}],
             [{"text": "◀️ 목록", "callback_data": "menu:list"}],
@@ -389,6 +404,24 @@ async def _handle_session_text(
             )
             return True
         session.data.update(min_price=minimum, max_price=maximum)
+        session.step = "add_ignore_price"
+        await _send(
+            client,
+            token,
+            chat_id,
+            "🚫 무시할 최저가격을 입력해주세요.\n"
+            "예: 10000 → 10,000원 이하 매물은 무시\n"
+            "사용하지 않으려면 0을 입력하세요.",
+        )
+        return True
+
+    if session.step == "add_ignore_price":
+        try:
+            ignore_price = _parse_nonnegative_price(text)
+        except (ValueError, TypeError):
+            await _send(client, token, chat_id, "❌ 0 이상의 가격을 입력해주세요.")
+            return True
+        session.data["ignore_price_at_or_below"] = ignore_price
         session.step = "add_region"
         await _send(
             client,
@@ -455,6 +488,7 @@ async def _handle_session_text(
             "✅ 등록할까요?\n\n"
             f"상품: {session.data['name']}\n"
             f"💰 {_format_price_range(session.data['min_price'], session.data['max_price'])}\n"
+            f"🚫 무시가격: {_format_ignore_price(session.data['ignore_price_at_or_below'])}\n"
             f"📍 당근: {region_text}\n"
             f"🏙 중고나라/번개: {city_preview}\n\n"
             "등록 직후 첫 검색을 시작하고, 조건에 맞는 기존 매물도 "
@@ -473,6 +507,33 @@ async def _handle_session_text(
                     ]
                 ]
             },
+        )
+        return True
+
+    if session.step == "edit_ignore_price":
+        try:
+            ignore_price = _parse_nonnegative_price(text)
+        except (ValueError, TypeError):
+            await _send(client, token, chat_id, "❌ 0 이상의 가격을 입력해주세요.")
+            return True
+        store = Store(_db_path())
+        try:
+            watch_id = int(session.data["watch_id"])
+            if not store.set_ignore_price_at_or_below(watch_id, ignore_price):
+                await _send(client, token, chat_id, "이미 삭제된 슬롯입니다.")
+                return True
+            store.reset_watch_tracking(watch_id)
+        finally:
+            store.close()
+        _SESSIONS.pop(chat_id, None)
+        request_scan()
+        await _send(
+            client,
+            token,
+            chat_id,
+            f"✅ 무시가격 변경: {_format_ignore_price(ignore_price)}\n"
+            "조건을 다시 적용하기 위해 첫 검색을 새로 시작합니다.",
+            _menu_keyboard(),
         )
         return True
 
@@ -590,6 +651,7 @@ async def _handle_callback(
                 detail = (
                     f"#{watch_id} {'🟢 감시중' if enabled else '⏸ 일시정지'} · {watch.name}\n\n"
                     f"💰 {_format_price_range(watch.min_price, watch.max_price)}\n"
+                    f"🚫 무시가격: {_format_ignore_price(watch.ignore_price_at_or_below)}\n"
                     f"📍 당근: {region}\n"
                     f"🏙 중고나라/번개: {market_city_text(watch)}\n"
                     f"🚫 제외: {excluded}"
@@ -602,6 +664,17 @@ async def _handle_callback(
             if action == "price":
                 _set_session(chat_id, "edit_price", watch_id=watch_id)
                 await _send(client, token, chat_id, "💰 새 가격을 입력해주세요.")
+
+            elif action == "ignore":
+                _set_session(chat_id, "edit_ignore_price", watch_id=watch_id)
+                await _send(
+                    client,
+                    token,
+                    chat_id,
+                    "🚫 새 무시가격을 입력해주세요.\n"
+                    "예: 10000 → 10,000원 이하 무시\n"
+                    "0 → 사용 안 함",
+                )
 
             elif action == "region":
                 _set_session(chat_id, "edit_region", watch_id=watch_id)
@@ -671,6 +744,9 @@ async def _handle_callback(
                 int(session.data["max_price"]),
                 session.data.get("regions") or [],
                 min_price=session.data.get("min_price"),
+                ignore_price_at_or_below=int(
+                    session.data.get("ignore_price_at_or_below", 0)
+                ),
             )
             name = session.data["name"]
             _SESSIONS.pop(chat_id, None)
