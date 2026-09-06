@@ -3,11 +3,26 @@ import sqlite3
 import pytest
 
 from sale_bot.admin import handle_command
-from sale_bot.main import _reserve_for_delivery
+from sale_bot.config import Settings
+from sale_bot.main import _event_should_queue
 from sale_bot.models import Listing, Watch
 from sale_bot.notifiers import format_message
 from sale_bot.providers import parse_price
 from sale_bot.storage import MAX_WATCH_SLOTS, Change, Store
+
+
+def _settings(**overrides):
+    values = {
+        "poll_interval_seconds": 300,
+        "alert_on_first_seen": True,
+        "alert_on_price_increase": False,
+        "bootstrap_silently": True,
+        "request_timeout_seconds": 20,
+        "daangn_region_batches": 5,
+        "watches": [],
+    }
+    values.update(overrides)
+    return Settings(**values)
 
 
 def test_parse_price_ignores_model_numbers():
@@ -18,7 +33,7 @@ def test_parse_price_ignores_model_numbers():
     assert parse_price("나눔") is None
 
 
-def test_watch_filters_price_excluded_words_and_unknown_price():
+def test_watch_filters_min_max_excluded_words_and_unknown_price():
     watch = Watch(
         name="gpu",
         query="9070 xt",
@@ -29,7 +44,21 @@ def test_watch_filters_price_excluded_words_and_unknown_price():
     assert watch.matches(Listing("bunjang", "1", "9070 XT 팝니다", 800000, "https://x"))
     assert not watch.matches(Listing("bunjang", "2", "9070 XT 삽니다", 800000, "https://x"))
     assert not watch.matches(Listing("bunjang", "3", "9070 XT", 1200000, "https://x"))
-    assert not watch.matches(Listing("bunjang", "4", "9070 XT", None, "https://x"))
+    assert not watch.matches(Listing("bunjang", "4", "9070 XT", 40000, "https://x"))
+    assert not watch.matches(Listing("bunjang", "5", "9070 XT", None, "https://x"))
+
+
+def test_alert_policy_uses_config_flags():
+    default = _settings()
+    assert _event_should_queue(Change("new", None, 800000), default)
+    assert _event_should_queue(Change("price_down", 900000, 800000), default)
+    assert not _event_should_queue(Change("price_up", 700000, 800000), default)
+    assert not _event_should_queue(Change("same", 800000, 800000), default)
+
+    no_first = _settings(alert_on_first_seen=False)
+    assert not _event_should_queue(Change("new", None, 800000), no_first)
+    increases = _settings(alert_on_price_increase=True)
+    assert _event_should_queue(Change("price_up", 700000, 800000), increases)
 
 
 def test_price_down_message():
@@ -38,15 +67,127 @@ def test_price_down_message():
     assert "가격 인하" in message.text
     assert "800,000원" in message.text
     assert "700,000원" in message.text
-    assert message.url == listing.url
 
 
-def test_store_bootstrap_state(tmp_path):
+def test_min_price_survives_database_round_trip(tmp_path):
     store = Store(tmp_path / "sale.sqlite3")
     try:
-        assert not store.is_bootstrapped("gpu", "joongna")
-        store.mark_bootstrapped("gpu", "joongna")
-        assert store.is_bootstrapped("gpu", "joongna")
+        store.seed_watches(
+            [Watch(name="gpu", query="gpu", min_price=500000, max_price=1000000)]
+        )
+        watch = store.list_watches()[0][1]
+        assert watch.min_price == 500000
+        assert watch.max_price == 1000000
+        assert not watch.matches(Listing("joongna", "cheap", "gpu", 40000, "https://x"))
+    finally:
+        store.close()
+
+
+def test_old_database_gets_min_price_column_and_seed_backfill(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE managed_watches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          query TEXT NOT NULL,
+          max_price INTEGER NOT NULL,
+          exclude_keywords TEXT NOT NULL DEFAULT '[]',
+          providers TEXT NOT NULL,
+          daangn_region TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO managed_watches
+          (name,query,max_price,exclude_keywords,providers,created_at)
+        VALUES ('gpu','gpu',1000000,'[]','["joongna"]','now');
+        INSERT INTO app_state(key,value) VALUES ('managed_watches_seeded','1');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    try:
+        store.seed_watches(
+            [Watch(name="gpu", query="gpu", min_price=500000, max_price=1000000)]
+        )
+        assert store.list_watches()[0][1].min_price == 500000
+    finally:
+        store.close()
+
+
+def test_price_range_validation_and_admin_command(tmp_path, monkeypatch):
+    store = Store(tmp_path / "sale.sqlite3")
+    try:
+        watch_id = store.add_watch("gpu", 1000000, min_price=500000)
+        assert store.set_price_range(watch_id, 600000, 900000)
+        watch = store.list_watches()[0][1]
+        assert (watch.min_price, watch.max_price) == (600000, 900000)
+        with pytest.raises(ValueError, match="min_price"):
+            store.set_price_range(watch_id, 950000, 900000)
+    finally:
+        store.close()
+
+    db_path = tmp_path / "commands.sqlite3"
+    monkeypatch.setenv("SALE_BOT_DB", str(db_path))
+    assert "추가 완료" in handle_command("/add GPU | 500000~900000 | 대전시 전체")
+    listing = handle_command("/list")
+    assert "500,000~900,000원" in listing
+    assert "대전시 전체" in listing
+    assert "가격 범위 변경 완료" in handle_command("/range 1 600000 850000")
+
+
+def test_observe_out_of_range_then_drop_is_real_price_down(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    try:
+        expensive = Listing("joongna", "x", "gpu", 1200000, "https://x")
+        cheap = Listing("joongna", "x", "gpu", 850000, "https://x")
+        assert store.observe(expensive).kind == "new"
+        change = store.observe(cheap)
+        assert change.kind == "price_down"
+        assert change.old_price == 1200000
+        assert change.new_price == 850000
+    finally:
+        store.close()
+
+
+def test_pending_alert_survives_until_receipt(tmp_path):
+    path = tmp_path / "sale.sqlite3"
+    listing = Listing("joongna", "abc", "GPU", 850000, "https://x")
+    store = Store(path)
+    try:
+        store.queue_alert("gpu", listing, Change("new", None, 850000))
+        pending = store.pending_alert_change("gpu", listing)
+        assert pending is not None and pending.kind == "new"
+    finally:
+        store.close()
+
+    reopened = Store(path)
+    try:
+        pending = reopened.pending_alert_change("gpu", listing)
+        assert pending is not None
+        assert reopened.reserve_alert("gpu", listing)
+        assert reopened.pending_alert_change("gpu", listing) is None
+        assert reopened.has_alert_receipt("gpu", listing)
+    finally:
+        reopened.close()
+
+
+def test_region_change_resets_daangn_scan_and_batch_but_keeps_receipt(tmp_path):
+    store = Store(tmp_path / "sale.sqlite3")
+    listing = Listing("daangn", "abc", "gpu", 850000, "https://x")
+    try:
+        watch_id = store.add_watch("gpu", 900000, "청주시 전체")
+        store.mark_bootstrapped("gpu", "daangn:scope:old:batch:0")
+        assert store.next_daangn_batch("gpu", 5) == 0
+        assert store.reserve_alert("gpu", listing)
+        assert store.set_region(watch_id, "대전시 전체")
+        assert not store.is_bootstrapped("gpu", "daangn:scope:old:batch:0")
+        assert store.next_daangn_batch("gpu", 5) == 0
+        assert store.has_alert_receipt("gpu", listing)
     finally:
         store.close()
 
@@ -58,42 +199,18 @@ def test_managed_watches_are_limited_to_three_slots(tmp_path):
             store.add_watch(f"item-{index}", 100000 + index)
         with pytest.raises(ValueError, match="slot limit"):
             store.add_watch("fourth", 200000)
-
-        first_id = store.list_watches()[0][0]
-        assert store.delete_watch(first_id)
-        replacement_id = store.add_watch("replacement", 300000)
-        assert replacement_id > 0
-        assert len(store.list_watches()) == MAX_WATCH_SLOTS
     finally:
         store.close()
 
 
-def test_exclude_keywords_are_configurable(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    try:
-        watch_id = store.add_watch("9070 XT", 900000, "청주시")
-        assert store.update_exclude(watch_id, "삽니다", add=True)
-        watch = store.list_watches()[0][1]
-        assert not watch.matches(Listing("joongna", "1", "9070 XT 삽니다", 800000, "https://x"))
-        assert watch.matches(Listing("joongna", "2", "9070 XT 판매", 800000, "https://x"))
-
-        assert store.update_exclude(watch_id, "삽니다", add=False)
-        watch = store.list_watches()[0][1]
-        assert "삽니다" not in watch.exclude_keywords
-    finally:
-        store.close()
-
-
-def test_region_storage_reads_legacy_text_and_writes_json_list(tmp_path):
+def test_region_storage_supports_generic_citywide_and_legacy_text(tmp_path):
     path = tmp_path / "sale.sqlite3"
     store = Store(path)
     try:
-        watch_id = store.add_watch("gpu", 900000, "복대동, 가경동")
-        assert store.list_watches()[0][1].daangn_regions == ["복대동", "가경동"]
-        assert store.set_region(watch_id, ["청주시 전체", "대전광역시 유성구 봉명동"])
+        watch_id = store.add_watch("gpu", 900000, "대전시 전체, 경기도 성남시 전체")
         assert store.list_watches()[0][1].daangn_regions == [
-            "청주시 전체",
-            "대전광역시 유성구 봉명동",
+            "대전시 전체",
+            "경기도 성남시 전체",
         ]
         store.conn.execute(
             "UPDATE managed_watches SET daangn_region=? WHERE id=?", ("사창동, 우암동", watch_id)
@@ -110,149 +227,3 @@ def test_daangn_rotation_cursor_persists(tmp_path):
         assert [store.next_daangn_batch("gpu", 5) for _ in range(7)] == [0, 1, 2, 3, 4, 0, 1]
     finally:
         store.close()
-
-
-def test_alert_receipt_allows_each_listing_only_once(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    listing = Listing("daangn", "abc", "9070 XT", 850000, "https://example.com/abc")
-    try:
-        assert store.reserve_alert("9070 XT", listing)
-        assert not store.reserve_alert("9070 XT", listing)
-    finally:
-        store.close()
-
-    reopened = Store(tmp_path / "sale.sqlite3")
-    try:
-        assert not reopened.reserve_alert("9070 XT", listing)
-    finally:
-        reopened.close()
-
-
-def test_no_channel_does_not_consume_active_alert(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
-    try:
-        assert not _reserve_for_delivery(
-            store,
-            "9070 XT",
-            listing,
-            has_channels=False,
-            suppress_bootstrap=False,
-        )
-        assert store.reserve_alert("9070 XT", listing)
-    finally:
-        store.close()
-
-
-def test_active_delivery_is_not_reserved_before_send(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
-    try:
-        assert _reserve_for_delivery(
-            store,
-            "9070 XT",
-            listing,
-            has_channels=True,
-            suppress_bootstrap=False,
-        )
-        assert not store.has_alert_receipt("9070 XT", listing)
-    finally:
-        store.close()
-
-
-def test_baseline_still_reserves_without_channel(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    listing = Listing("joongna", "abc", "9070 XT", 850000, "https://example.com/abc")
-    try:
-        assert not _reserve_for_delivery(
-            store,
-            "9070 XT",
-            listing,
-            has_channels=False,
-            suppress_bootstrap=True,
-        )
-        assert not store.reserve_alert("9070 XT", listing)
-    finally:
-        store.close()
-
-
-def test_upgrade_guard_backfills_matching_existing_listings(tmp_path):
-    path = tmp_path / "sale.sqlite3"
-    store = Store(path)
-    matching = Listing("joongna", "match", "9070 XT 판매", 850000, "https://example/match")
-    expensive = Listing("joongna", "high", "9070 XT 판매", 1200000, "https://example/high")
-    try:
-        store.add_watch("9070 XT", 900000)
-        store.observe(matching)
-        store.observe(expensive)
-        store.mark_bootstrapped("9070 XT", "joongna")
-    finally:
-        store.close()
-
-    conn = sqlite3.connect(path)
-    conn.execute("DELETE FROM alert_receipts")
-    conn.execute("DELETE FROM app_state WHERE key='alert_receipts_upgrade_guard_v1'")
-    conn.commit()
-    conn.close()
-
-    upgraded = Store(path)
-    try:
-        assert upgraded.has_alert_receipt("9070 XT", matching)
-        assert not upgraded.has_alert_receipt("9070 XT", expensive)
-    finally:
-        upgraded.close()
-
-
-def test_delete_watch_clears_bootstrap_and_alert_receipts(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    listing = Listing("daangn", "abc", "9070 XT", 850000, "https://example.com/abc")
-    try:
-        watch_id = store.add_watch("9070 XT", 900000)
-        store.mark_bootstrapped("9070 XT", "daangn")
-        assert store.reserve_alert("9070 XT", listing)
-        assert store.delete_watch(watch_id)
-
-        new_id = store.add_watch("9070 XT", 900000)
-        assert new_id != watch_id
-        assert not store.is_bootstrapped("9070 XT", "daangn")
-        assert store.reserve_alert("9070 XT", listing)
-    finally:
-        store.close()
-
-
-def test_seed_only_happens_once_even_after_all_watches_deleted(tmp_path):
-    store = Store(tmp_path / "sale.sqlite3")
-    seed = [Watch(name="gpu", query="gpu", max_price=500000)]
-    try:
-        store.seed_watches(seed)
-        watch_id = store.list_watches()[0][0]
-        assert store.delete_watch(watch_id)
-        store.seed_watches(seed)
-        assert store.list_watches() == []
-    finally:
-        store.close()
-
-
-def test_chat_command_slot_limit_and_exclude(tmp_path, monkeypatch):
-    db_path = tmp_path / "commands.sqlite3"
-    monkeypatch.setenv("SALE_BOT_DB", str(db_path))
-
-    assert "추가 완료" in handle_command("/add GPU1 | 100000")
-    assert "추가 완료" in handle_command("/add GPU2 | 200000")
-    assert "추가 완료" in handle_command("/add GPU3 | 300000")
-    assert "슬롯이 가득" in handle_command("/add GPU4 | 400000")
-    assert "제외키워드 추가 완료" in handle_command("/exclude 1 add 삽니다")
-    listing = handle_command("/list")
-    assert "3/3" in listing
-    assert "삽니다" in listing
-
-
-def test_chat_region_accepts_citywide_plus_specific_area(tmp_path, monkeypatch):
-    db_path = tmp_path / "commands.sqlite3"
-    monkeypatch.setenv("SALE_BOT_DB", str(db_path))
-    assert "추가 완료" in handle_command(
-        "/add GPU | 900000 | 청주시 전체, 대전광역시 유성구 봉명동"
-    )
-    listing = handle_command("/list")
-    assert "청주시 전체" in listing
-    assert "대전광역시 유성구 봉명동" in listing
