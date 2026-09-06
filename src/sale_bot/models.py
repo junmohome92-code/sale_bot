@@ -10,7 +10,6 @@ MAX_DAANGN_REGION_SPECS = 10
 def split_daangn_regions(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
     if not value:
         return []
-
     raw_parts: list[str] = []
     if isinstance(value, str):
         raw_parts.extend(re.split(r"[,;\n]+", value))
@@ -49,6 +48,7 @@ class Watch:
     providers: list[ProviderName] = field(default_factory=lambda: ["daangn", "joongna", "bunjang"])
     daangn_region: str | None = None
     daangn_regions: list[str] = field(default_factory=list)
+    # Legacy diagnostic-only fields. Runtime scheduling no longer exposes batch tuning.
     daangn_batch_index: int = 0
     daangn_batch_count: int = 5
 
