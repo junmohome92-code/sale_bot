@@ -12,116 +12,75 @@ HEADERS = {
 }
 
 
-async def request(client, location_filter):
+def city_match(location_names, city):
+    needle = city.replace(" ", "")
+    aliases = {needle}
+    if needle == "청주시":
+        aliases.update({"충청북도청주시", "충북청주시"})
+    if needle in {"세종시", "세종특별자치시"}:
+        aliases.update({"세종시", "세종특별자치시"})
+    for value in location_names or []:
+        compact = str(value).replace(" ", "")
+        if any(alias in compact for alias in aliases):
+            return True
+    return False
+
+
+async def search(client, search_word, city):
     body = {
-        "searchWord": "닌텐도 스위치2",
+        "searchWord": search_word,
         "keywordSource": "INPUT_KEYWORD",
         "actionDetailType": "NONE",
         "page": 0,
-        "size": 20,
+        "size": 50,
         "sort": "RECENT_SORT",
-        "filter": {"locationFilter": location_filter},
+        "filter": {},
     }
-    return await client.post(API, json=body)
+    response = await client.post(API, json=body)
+    print("\nQUERY", search_word, "STATUS", response.status_code)
+    payload = response.json()
+    data = payload.get("data") or {}
+    rows = data.get("items") or []
+    print("TOTAL", data.get("totalSize"), "RETURNED", len(rows))
 
+    known = 0
+    matched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        location_names = row.get("locationNames") or []
+        main_location = row.get("mainLocationName")
+        if location_names or main_location:
+            known += 1
+        if city_match(location_names, city) or city_match([main_location] if main_location else [], city):
+            matched.append(row)
 
-def detail(response):
-    text = response.text.replace("\n", " ")
-    try:
-        payload = response.json()
-        meta = payload.get("meta") or {}
-        details = meta.get("detail") or []
-        if details:
-            return str(details[0].get("message") or details[0])[:1000]
-        if response.status_code == 200:
-            data = payload.get("data") or {}
-            rows = data.get("items") or []
-            locs = []
-            for row in rows[:8]:
-                if isinstance(row, dict):
-                    locs.append(row.get("locationNames"))
-            return f"total={data.get('totalSize')} locs={locs}"
-    except Exception:
-        pass
-    return text[:1000]
+    print("LOCATION_KNOWN", known, "CITY_MATCH", len(matched))
+    for row in matched[:10]:
+        print(
+            json.dumps(
+                {
+                    "id": row.get("seq") or row.get("id"),
+                    "title": row.get("title"),
+                    "price": row.get("price"),
+                    "mainLocationName": row.get("mainLocationName"),
+                    "locationNames": row.get("locationNames"),
+                },
+                ensure_ascii=False,
+            )
+        )
 
 
 async def main():
-    # Put an intentionally wrong JSON type under likely field names. A real field should
-    # make Jackson name that field in its path; unknown fields tend to be ignored and
-    # fall through to the service's generic 500 for an empty LocationFilter.
-    field_candidates = [
-        "lat",
-        "lng",
-        "lon",
-        "latitude",
-        "longitude",
-        "distance",
-        "radius",
-        "range",
-        "rangeKm",
-        "distanceKm",
-        "locationId",
-        "locationIds",
-        "locationSeq",
-        "locationSeqs",
-        "regionId",
-        "regionIds",
-        "regionCode",
-        "regionCodes",
-        "code",
-        "codes",
-        "address",
-        "addressName",
-        "locationName",
-        "locationNames",
-        "name",
-        "names",
-        "city",
-        "cityCode",
-        "sido",
-        "sigungu",
-        "emd",
-        "dong",
-        "emdCode",
-        "legalDongCode",
-        "latitudeLongitude",
-        "coordinates",
-        "point",
-        "center",
-    ]
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=HEADERS) as client:
-        for field in field_candidates:
-            # Array/object mismatch is deliberate and makes valid scalar fields obvious.
-            value = {field: {"__probe__": True}}
-            try:
-                response = await request(client, value)
-                print(f"FIELD {field} STATUS {response.status_code} DETAIL {detail(response)}")
-            except Exception as exc:
-                print(f"FIELD {field} EXC {exc!r}")
-
-        # Common coordinate object shapes, with Cheongju city-centre-ish coordinates.
-        candidates = [
-            {"latitude": 36.6424, "longitude": 127.4890, "distance": 30},
-            {"latitude": 36.6424, "longitude": 127.4890, "radius": 30},
-            {"lat": 36.6424, "lng": 127.4890, "distance": 30},
-            {"lat": 36.6424, "lng": 127.4890, "radius": 30},
-            {"lat": 36.6424, "lon": 127.4890, "radius": 30},
-        ]
-        for index, value in enumerate(candidates):
-            try:
-                response = await request(client, value)
-                print(
-                    "SHAPE",
-                    index,
-                    json.dumps(value, ensure_ascii=False),
-                    "STATUS",
-                    response.status_code,
-                    "DETAIL",
-                    detail(response),
-                )
-            except Exception as exc:
-                print(f"SHAPE {index} EXC {exc!r}")
+        for query, city in [
+            ("닌텐도 스위치2", "청주시"),
+            ("청주시 닌텐도 스위치2", "청주시"),
+            ("청주 닌텐도 스위치2", "청주시"),
+            ("세종시 닌텐도 스위치2", "세종시"),
+            ("세종 닌텐도 스위치2", "세종시"),
+        ]:
+            await search(client, query, city)
 
 
 if __name__ == "__main__":
