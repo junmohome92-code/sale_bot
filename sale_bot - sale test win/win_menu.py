@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ROOT.parent
 DB_FILES = (
     ROOT / "data" / "sale_bot-win.sqlite3",
     ROOT / "data" / "sale_bot-win.sqlite3-shm",
@@ -51,11 +52,10 @@ def reset_test_db() -> None:
             path.unlink()
             deleted = True
     if deleted:
-        print("Windows 테스트 DB를 초기화했습니다.")
-        print("다음 3번/4번 실행에서 config.yaml의 감시 설정을 새로 적용합니다.")
+        print("Windows 테스트 DB를 완전 초기화했습니다.")
     else:
         print("초기화할 Windows 테스트 DB가 없습니다.")
-        print("다음 실행에서 config.yaml 설정이 새로 seed됩니다.")
+    print("다음 실행은 완전히 새 DB/새 슬롯 상태로 시작합니다.")
 
 
 def main() -> None:
@@ -70,10 +70,10 @@ def main() -> None:
         print("  2. 코드 테스트")
         print("  3. 중고마켓 실제 검색 1회")
         print("  4. 계속 실행")
-        print("  5. 검색 설정 열기 (config.yaml)")
-        print("  6. 텔레그램/디스코드 설정 열기 (.env)")
-        print("  7. 설정 변경 적용 / Windows 테스트 DB 초기화")
-        print("  8. 당근 현재 batch 지역/검색 진단")
+        print("  5. 초기 seed/런타임 설정 열기 (config.yaml)")
+        print("  6. 텔레그램/디스코드 알림 설정 열기 (.env)")
+        print("  7. Windows 테스트 DB 완전 초기화")
+        print("  8. 당근 지역/검색 샘플 진단")
         print("  9. 당근 '전체' 지역 전수 해석 검증")
         print("  0. 종료")
         print()
@@ -88,12 +88,13 @@ def main() -> None:
         elif choice == "4":
             run_ps("run")
         elif choice == "5":
-            open_file(ROOT / "config.yaml", ROOT / "config.example.yaml")
-            print("설정을 바꾼 뒤 기존 테스트 DB에도 적용하려면 메뉴 7번을 실행하세요.")
+            open_file(ROOT / "config.yaml", REPO_ROOT / "config.example.yaml")
+            print("watch 설정은 새 DB의 최초 seed 용도입니다.")
+            print("운영 중 슬롯 변경은 Telegram /menu 사용을 권장합니다.")
             input("Enter를 누르면 메뉴로 돌아갑니다.")
             continue
         elif choice == "6":
-            open_file(ROOT / ".env", ROOT / ".env.example")
+            open_file(ROOT / ".env", REPO_ROOT / ".env.example")
             continue
         elif choice == "7":
             reset_test_db()

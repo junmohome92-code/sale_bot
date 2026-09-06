@@ -1,11 +1,10 @@
-import json
 import os
 from dataclasses import dataclass
 
 import httpx
 
 from .models import Listing
-from .storage import Change
+from .storage import Change, TrackingState
 
 
 @dataclass(slots=True)
@@ -14,26 +13,57 @@ class Message:
     url: str
 
 
-def format_message(watch_name: str, listing: Listing, change: Change) -> Message:
+def _percent_drop(old: int | None, new: int | None) -> str | None:
+    if old is None or new is None or old <= 0 or new >= old:
+        return None
+    return f"-{((old - new) / old) * 100:.1f}%"
+
+
+def format_message(
+    watch_name: str,
+    listing: Listing,
+    change: Change,
+    state: TrackingState | None = None,
+) -> Message:
     labels = {
-        "new": "🆕 새 매물",
-        "price_down": "📉 가격 인하",
-        "price_up": "📈 가격 인상",
+        "new": "🆕 신규 조건충족",
+        "price_down": "📉 가격 하락",
         "price_changed": "💱 가격 변경",
     }
-    label = labels.get(change.kind, "🔔 변경")
+    provider_labels = {
+        "daangn": "당근",
+        "joongna": "중고나라",
+        "bunjang": "번개장터",
+    }
+    label = labels.get(change.kind, "🔔 매물 알림")
     price = f"{listing.price:,}원" if listing.price is not None else "가격 미상"
-    previous = ""
-    if change.old_price is not None and change.old_price != listing.price:
-        previous = f"\n이전 가격: {change.old_price:,}원"
-    location = f"\n지역: {listing.location}" if listing.location else ""
-    text = (
-        f"{label} · {watch_name}\n"
-        f"[{listing.provider}] {listing.title}\n"
-        f"가격: {price}{previous}{location}\n"
-        f"{listing.url}"
-    )
-    return Message(text=text, url=listing.url)
+    lines = [f"{label} · {watch_name}", "", f"💰 {price}"]
+
+    if (
+        change.old_price is not None
+        and listing.price is not None
+        and change.old_price != listing.price
+    ):
+        drop = _percent_drop(change.old_price, listing.price)
+        suffix = f" ({drop})" if drop else ""
+        lines.append(f"📉 이전 가격: {change.old_price:,}원 → {listing.price:,}원{suffix}")
+
+    if state and state.last_alert_price is not None and state.last_alert_price != listing.price:
+        lines.append(f"🔔 마지막 알림가: {state.last_alert_price:,}원")
+
+    if state and state.first_seen_price is not None and listing.price is not None:
+        first_drop = _percent_drop(state.first_seen_price, listing.price)
+        if first_drop:
+            lines.append(
+                f"📊 최초 발견: {state.first_seen_price:,}원 → "
+                f"{listing.price:,}원 ({first_drop})"
+            )
+
+    if listing.location:
+        lines.append(f"📍 {listing.location}")
+    lines.append(f"🏪 {provider_labels.get(listing.provider, listing.provider)}")
+    lines.extend(["", listing.title, "", f"🔗 {listing.url}"])
+    return Message(text="\n".join(lines), url=listing.url)
 
 
 class Notifier:
@@ -46,8 +76,6 @@ class Notifier:
             channels.append("telegram")
         if os.getenv("DISCORD_WEBHOOK_URL"):
             channels.append("discord")
-        if os.getenv("KAKAO_ACCESS_TOKEN"):
-            channels.append("kakao")
         return channels
 
     async def send(self, message: Message) -> bool:
@@ -59,16 +87,13 @@ class Notifier:
         webhook = os.getenv("DISCORD_WEBHOOK_URL")
         if webhook:
             jobs.append(("discord", self._discord(webhook, message.text)))
-        kakao_token = os.getenv("KAKAO_ACCESS_TOKEN")
-        if kakao_token:
-            jobs.append(("kakao", self._kakao(kakao_token, message.text, message.url)))
 
         delivered = False
         for channel, job in jobs:
             try:
                 await job
                 delivered = True
-            except Exception as exc:  # noqa: BLE001 - one channel must not block the others
+            except Exception as exc:  # noqa: BLE001 - one channel must not block another
                 print(f"[{channel}] notifier error: {exc}")
         return delivered
 
@@ -81,19 +106,6 @@ class Notifier:
 
     async def _discord(self, webhook: str, text: str) -> None:
         response = await self.client.post(webhook, json={"content": text[:1900]})
-        response.raise_for_status()
-
-    async def _kakao(self, token: str, text: str, url: str) -> None:
-        template = {
-            "object_type": "text",
-            "text": text[:1800],
-            "link": {"web_url": url, "mobile_web_url": url},
-        }
-        response = await self.client.post(
-            "https://kapi.kakao.com/v2/api/talk/memo/default/send",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"template_object": json.dumps(template, ensure_ascii=False)},
-        )
         response.raise_for_status()
 
     async def close(self) -> None:

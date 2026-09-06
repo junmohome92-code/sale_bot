@@ -6,7 +6,8 @@ from pathlib import Path
 
 from .models import Listing, Watch, split_daangn_regions
 
-MAX_WATCH_SLOTS = 3
+MAX_WATCH_SLOTS = 20
+SCHEMA_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -14,6 +15,18 @@ class Change:
     kind: str
     old_price: int | None
     new_price: int | None
+
+
+@dataclass(slots=True)
+class TrackingState:
+    first_seen_price: int | None
+    current_price: int | None
+    last_alert_price: int | None
+    alert_count: int
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def _encode_regions(regions: list[str]) -> str | None:
@@ -40,32 +53,21 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=10000")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+
+    def _table_exists(self, name: str) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()
+            is not None
+        )
+
+    def _init_schema(self) -> None:
+        # Preserve the watch table so current installations keep their configured slots.
         self.conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS listings (
-              provider TEXT NOT NULL,
-              external_id TEXT NOT NULL,
-              title TEXT NOT NULL,
-              url TEXT NOT NULL,
-              price INTEGER,
-              location TEXT,
-              first_seen_at TEXT NOT NULL,
-              last_seen_at TEXT NOT NULL,
-              PRIMARY KEY (provider, external_id)
-            );
-            CREATE TABLE IF NOT EXISTS price_history (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              provider TEXT NOT NULL,
-              external_id TEXT NOT NULL,
-              price INTEGER,
-              observed_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS scan_state (
-              watch_name TEXT NOT NULL,
-              provider TEXT NOT NULL,
-              bootstrapped_at TEXT NOT NULL,
-              PRIMARY KEY (watch_name, provider)
-            );
             CREATE TABLE IF NOT EXISTS managed_watches (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               name TEXT NOT NULL UNIQUE,
@@ -78,15 +80,53 @@ class Store:
               enabled INTEGER NOT NULL DEFAULT 1,
               created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS alert_receipts (
-              watch_name TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS runtime_state (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+            """
+        )
+        self._ensure_managed_watch_columns()
+
+        current = self.conn.execute(
+            "SELECT value FROM runtime_state WHERE key='schema_version'"
+        ).fetchone()
+        version = int(current["value"]) if current else 0
+        if version < SCHEMA_VERSION:
+            self._migrate_to_watch_scoped_tracking(version)
+
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS watch_listing_state (
+              watch_id INTEGER NOT NULL,
               provider TEXT NOT NULL,
               external_id TEXT NOT NULL,
-              alerted_at TEXT NOT NULL,
-              PRIMARY KEY (watch_name, provider, external_id)
+              title TEXT NOT NULL,
+              url TEXT NOT NULL,
+              location TEXT,
+              first_seen_price INTEGER,
+              current_price INTEGER,
+              last_alert_price INTEGER,
+              first_seen_at TEXT NOT NULL,
+              last_seen_at TEXT NOT NULL,
+              last_alert_at TEXT,
+              alert_count INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (watch_id, provider, external_id),
+              FOREIGN KEY (watch_id) REFERENCES managed_watches(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS alert_candidates (
-              watch_name TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS watch_price_history (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              watch_id INTEGER NOT NULL,
+              provider TEXT NOT NULL,
+              external_id TEXT NOT NULL,
+              price INTEGER,
+              observed_at TEXT NOT NULL,
+              FOREIGN KEY (watch_id) REFERENCES managed_watches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_watch_price_history_lookup
+              ON watch_price_history(watch_id,provider,external_id,observed_at);
+            CREATE TABLE IF NOT EXISTS pending_alerts (
+              watch_id INTEGER NOT NULL,
               provider TEXT NOT NULL,
               external_id TEXT NOT NULL,
               reason TEXT NOT NULL,
@@ -94,15 +134,32 @@ class Store:
               new_price INTEGER,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
-              PRIMARY KEY (watch_name, provider, external_id)
+              PRIMARY KEY (watch_id,provider,external_id),
+              FOREIGN KEY (watch_id) REFERENCES managed_watches(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS app_state (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS watch_scan_state (
+              watch_id INTEGER NOT NULL,
+              provider TEXT NOT NULL,
+              bootstrapped_at TEXT NOT NULL,
+              PRIMARY KEY (watch_id,provider),
+              FOREIGN KEY (watch_id) REFERENCES managed_watches(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS provider_status (
+              provider TEXT PRIMARY KEY,
+              last_round_started_at TEXT,
+              last_round_finished_at TEXT,
+              last_success_at TEXT,
+              duration_seconds REAL,
+              jobs INTEGER NOT NULL DEFAULT 0,
+              errors INTEGER NOT NULL DEFAULT 0,
+              message TEXT
             );
             """
         )
-        self._ensure_managed_watch_columns()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO runtime_state(key,value) VALUES ('schema_version',?)",
+            (str(SCHEMA_VERSION),),
+        )
         self.conn.commit()
 
     def _ensure_managed_watch_columns(self) -> None:
@@ -113,100 +170,79 @@ class Store:
         if "min_price" not in columns:
             self.conn.execute("ALTER TABLE managed_watches ADD COLUMN min_price INTEGER")
 
+    def _migrate_to_watch_scoped_tracking(self, previous_version: int) -> None:
+        # Legacy state used only provider+listing id. It cannot be mapped safely to
+        # overlapping watches, so v2 intentionally starts a fresh silent baseline.
+        legacy_seeded = False
+        if self._table_exists("app_state"):
+            legacy_seeded = (
+                self.conn.execute(
+                    "SELECT 1 FROM app_state WHERE key='managed_watches_seeded'"
+                ).fetchone()
+                is not None
+            )
+        has_watches = int(
+            self.conn.execute("SELECT COUNT(*) FROM managed_watches").fetchone()[0]
+        ) > 0
+        if previous_version == 0:
+            for table in (
+                "listings",
+                "price_history",
+                "alert_receipts",
+                "alert_candidates",
+                "scan_state",
+            ):
+                self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+            if self._table_exists("app_state"):
+                self.conn.execute("DELETE FROM app_state WHERE key LIKE 'daangn_batch:%'")
+        if has_watches or legacy_seeded:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO runtime_state(key,value) "
+                "VALUES ('watches_initialized','1')"
+            )
+        self.conn.commit()
+
+    def seed_watches(self, watches: list[Watch]) -> None:
+        initialized = self.conn.execute(
+            "SELECT 1 FROM runtime_state WHERE key='watches_initialized'"
+        ).fetchone()
+        if initialized:
+            return
+        now = _now()
+        for watch in watches[:MAX_WATCH_SLOTS]:
+            if watch.max_price is None:
+                continue
+            self.conn.execute(
+                """INSERT OR IGNORE INTO managed_watches
+                (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    watch.name,
+                    watch.query,
+                    watch.min_price,
+                    watch.max_price,
+                    json.dumps(watch.exclude_keywords, ensure_ascii=False),
+                    json.dumps(watch.providers),
+                    _encode_regions(watch.daangn_regions),
+                    now,
+                ),
+            )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO runtime_state(key,value) "
+            "VALUES ('watches_initialized','1')"
+        )
+        self.conn.commit()
+
     def _row_to_watch(self, row: sqlite3.Row) -> Watch:
         return Watch(
-            name=row["name"],
-            query=row["query"],
+            name=str(row["name"]),
+            query=str(row["query"]),
             min_price=int(row["min_price"]) if row["min_price"] is not None else None,
             max_price=int(row["max_price"]),
             exclude_keywords=json.loads(row["exclude_keywords"]),
             providers=json.loads(row["providers"]),
             daangn_regions=_decode_regions(row["daangn_region"]),
         )
-
-    def _upgrade_alert_receipts_guard(self) -> None:
-        marker = "alert_receipts_upgrade_guard_v1"
-        if self.conn.execute("SELECT 1 FROM app_state WHERE key=?", (marker,)).fetchone():
-            return
-
-        scan_count = int(self.conn.execute("SELECT COUNT(*) FROM scan_state").fetchone()[0])
-        receipt_count = int(self.conn.execute("SELECT COUNT(*) FROM alert_receipts").fetchone()[0])
-        if scan_count > 0 and receipt_count == 0:
-            now = datetime.now(UTC).isoformat()
-            for _, watch, _ in self.list_watches():
-                for provider in watch.providers:
-                    rows = self.conn.execute(
-                        "SELECT * FROM listings WHERE provider=?", (provider,)
-                    ).fetchall()
-                    for row in rows:
-                        listing = Listing(
-                            provider,
-                            str(row["external_id"]),
-                            str(row["title"]),
-                            row["price"],
-                            str(row["url"]),
-                            location=row["location"],
-                        )
-                        if watch.matches(listing):
-                            self.conn.execute(
-                                """INSERT OR IGNORE INTO alert_receipts
-                                (watch_name,provider,external_id,alerted_at)
-                                VALUES (?,?,?,?)""",
-                                (watch.name, provider, listing.external_id, now),
-                            )
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO app_state(key,value) VALUES (?,?)", (marker, "1")
-        )
-        self.conn.commit()
-
-    def _backfill_min_price_from_seed(self, watches: list[Watch]) -> None:
-        marker = "managed_watches_min_price_backfill_v1"
-        if self.conn.execute("SELECT 1 FROM app_state WHERE key=?", (marker,)).fetchone():
-            return
-        for watch in watches:
-            if watch.min_price is None:
-                continue
-            self.conn.execute(
-                """UPDATE managed_watches SET min_price=?
-                WHERE name=? AND min_price IS NULL""",
-                (watch.min_price, watch.name),
-            )
-        self.conn.execute(
-            "INSERT OR REPLACE INTO app_state(key,value) VALUES (?,?)", (marker, "1")
-        )
-        self.conn.commit()
-
-    def seed_watches(self, watches: list[Watch]) -> None:
-        seeded = self.conn.execute(
-            "SELECT 1 FROM app_state WHERE key='managed_watches_seeded'"
-        ).fetchone()
-        if not seeded:
-            now = datetime.now(UTC).isoformat()
-            for watch in watches[:MAX_WATCH_SLOTS]:
-                if watch.max_price is None:
-                    continue
-                self.conn.execute(
-                    """INSERT OR IGNORE INTO managed_watches
-                    (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                    (
-                        watch.name,
-                        watch.query,
-                        watch.min_price,
-                        watch.max_price,
-                        json.dumps(watch.exclude_keywords, ensure_ascii=False),
-                        json.dumps(watch.providers),
-                        _encode_regions(watch.daangn_regions),
-                        now,
-                    ),
-                )
-            self.conn.execute(
-                "INSERT OR REPLACE INTO app_state(key,value) VALUES ('managed_watches_seeded','1')"
-            )
-            self.conn.commit()
-        self._backfill_min_price_from_seed(watches)
-        self._upgrade_alert_receipts_guard()
 
     def list_watches(self, *, enabled_only: bool = False) -> list[tuple[int, Watch, bool]]:
         sql = "SELECT * FROM managed_watches"
@@ -215,8 +251,17 @@ class Store:
         sql += " ORDER BY id"
         rows = self.conn.execute(sql).fetchall()
         return [
-            (int(row["id"]), self._row_to_watch(row), bool(row["enabled"])) for row in rows
+            (int(row["id"]), self._row_to_watch(row), bool(row["enabled"]))
+            for row in rows
         ]
+
+    def get_watch(self, watch_id: int) -> tuple[Watch, bool] | None:
+        row = self.conn.execute(
+            "SELECT * FROM managed_watches WHERE id=?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_watch(row), bool(row["enabled"])
 
     def add_watch(
         self,
@@ -225,10 +270,14 @@ class Store:
         region: str | list[str] | None = None,
         *,
         min_price: int | None = None,
+        query: str | None = None,
+        providers: list[str] | None = None,
+        exclude_keywords: list[str] | None = None,
     ) -> int:
         name = name.strip()
-        if not name:
-            raise ValueError("watch name is required")
+        query = (query or name).strip()
+        if not name or not query:
+            raise ValueError("watch name/query is required")
         if max_price <= 0:
             raise ValueError("max_price must be positive")
         if min_price is not None and min_price < 0:
@@ -241,37 +290,33 @@ class Store:
         if self.conn.execute("SELECT 1 FROM managed_watches WHERE name=?", (name,)).fetchone():
             raise ValueError("watch name already exists")
 
-        now = datetime.now(UTC).isoformat()
         cur = self.conn.execute(
             """INSERT INTO managed_watches
             (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
-            VALUES (?,?,?,?,'[]',?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?)""",
             (
                 name,
-                name,
+                query,
                 min_price,
                 max_price,
-                json.dumps(["daangn", "joongna", "bunjang"]),
+                json.dumps(exclude_keywords or [], ensure_ascii=False),
+                json.dumps(providers or ["daangn", "joongna", "bunjang"]),
                 _encode_regions(split_daangn_regions(region)),
-                now,
+                _now(),
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
     def delete_watch(self, watch_id: int) -> bool:
-        row = self.conn.execute(
-            "SELECT name FROM managed_watches WHERE id=?", (watch_id,)
-        ).fetchone()
-        if row is None:
+        if self.get_watch(watch_id) is None:
             return False
-        watch_name = str(row["name"])
-        self.conn.execute("DELETE FROM managed_watches WHERE id=?", (watch_id,))
-        self.conn.execute("DELETE FROM scan_state WHERE watch_name=?", (watch_name,))
-        self.conn.execute("DELETE FROM alert_receipts WHERE watch_name=?", (watch_name,))
-        self.conn.execute("DELETE FROM alert_candidates WHERE watch_name=?", (watch_name,))
-        self.conn.execute("DELETE FROM app_state WHERE key=?", (f"daangn_batch:{watch_name}",))
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute("DELETE FROM pending_alerts WHERE watch_id=?", (watch_id,))
+            self.conn.execute("DELETE FROM watch_price_history WHERE watch_id=?", (watch_id,))
+            self.conn.execute("DELETE FROM watch_listing_state WHERE watch_id=?", (watch_id,))
+            self.conn.execute("DELETE FROM watch_scan_state WHERE watch_id=?", (watch_id,))
+            self.conn.execute("DELETE FROM managed_watches WHERE id=?", (watch_id,))
         return True
 
     def set_watch_enabled(self, watch_id: int, enabled: bool) -> bool:
@@ -287,10 +332,9 @@ class Store:
         ).fetchone()
         if row is None:
             return False
-        min_price = row["min_price"]
         if max_price <= 0:
             raise ValueError("max_price must be positive")
-        if min_price is not None and int(min_price) > max_price:
+        if row["min_price"] is not None and int(row["min_price"]) > max_price:
             raise ValueError("max_price cannot be lower than min_price")
         self.conn.execute(
             "UPDATE managed_watches SET max_price=? WHERE id=?", (max_price, watch_id)
@@ -298,9 +342,7 @@ class Store:
         self.conn.commit()
         return True
 
-    def set_price_range(
-        self, watch_id: int, min_price: int | None, max_price: int
-    ) -> bool:
+    def set_price_range(self, watch_id: int, min_price: int | None, max_price: int) -> bool:
         if max_price <= 0:
             raise ValueError("max_price must be positive")
         if min_price is not None and min_price < 0:
@@ -314,42 +356,32 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def _reset_daangn_state(self, watch_name: str) -> None:
-        self.conn.execute(
-            "DELETE FROM scan_state WHERE watch_name=? AND provider LIKE 'daangn%'",
-            (watch_name,),
-        )
-        self.conn.execute(
-            "DELETE FROM alert_candidates WHERE watch_name=? AND provider='daangn'",
-            (watch_name,),
-        )
-        self.conn.execute("DELETE FROM app_state WHERE key=?", (f"daangn_batch:{watch_name}",))
-
     def set_region(self, watch_id: int, region: str | list[str] | None) -> bool:
-        row = self.conn.execute(
-            "SELECT name FROM managed_watches WHERE id=?", (watch_id,)
-        ).fetchone()
-        if row is None:
+        if self.get_watch(watch_id) is None:
             return False
-        self.conn.execute(
-            "UPDATE managed_watches SET daangn_region=? WHERE id=?",
-            (_encode_regions(split_daangn_regions(region)), watch_id),
-        )
-        self._reset_daangn_state(str(row["name"]))
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE managed_watches SET daangn_region=? WHERE id=?",
+                (_encode_regions(split_daangn_regions(region)), watch_id),
+            )
+            # A region change is a new Daangn search universe for this slot.
+            self.conn.execute(
+                "DELETE FROM pending_alerts WHERE watch_id=? AND provider='daangn'",
+                (watch_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM watch_price_history WHERE watch_id=? AND provider='daangn'",
+                (watch_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM watch_listing_state WHERE watch_id=? AND provider='daangn'",
+                (watch_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM watch_scan_state WHERE watch_id=? AND provider='daangn'",
+                (watch_id,),
+            )
         return True
-
-    def next_daangn_batch(self, watch_name: str, batch_count: int) -> int:
-        batch_count = max(1, batch_count)
-        key = f"daangn_batch:{watch_name}"
-        row = self.conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
-        current = int(row["value"]) if row else 0
-        self.conn.execute(
-            "INSERT OR REPLACE INTO app_state(key,value) VALUES (?,?)",
-            (key, str((current + 1) % batch_count)),
-        )
-        self.conn.commit()
-        return current % batch_count
 
     def update_exclude(self, watch_id: int, keyword: str, *, add: bool) -> bool:
         keyword = keyword.strip()
@@ -372,46 +404,100 @@ class Store:
         self.conn.commit()
         return True
 
-    def has_alert_receipt(self, watch_name: str, listing: Listing) -> bool:
-        return (
+    def observe(self, watch_id: int, listing: Listing) -> Change:
+        now = _now()
+        row = self.conn.execute(
+            """SELECT current_price FROM watch_listing_state
+            WHERE watch_id=? AND provider=? AND external_id=?""",
+            (watch_id, listing.provider, listing.external_id),
+        ).fetchone()
+        if row is None:
             self.conn.execute(
-                """SELECT 1 FROM alert_receipts
-                WHERE watch_name=? AND provider=? AND external_id=?""",
-                (watch_name, listing.provider, listing.external_id),
-            ).fetchone()
-            is not None
-        )
+                """INSERT INTO watch_listing_state
+                (watch_id,provider,external_id,title,url,location,first_seen_price,current_price,
+                 first_seen_at,last_seen_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    watch_id,
+                    listing.provider,
+                    listing.external_id,
+                    listing.title,
+                    listing.url,
+                    listing.location,
+                    listing.price,
+                    listing.price,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                """INSERT INTO watch_price_history
+                (watch_id,provider,external_id,price,observed_at) VALUES (?,?,?,?,?)""",
+                (watch_id, listing.provider, listing.external_id, listing.price, now),
+            )
+            self.conn.commit()
+            return Change("new", None, listing.price)
 
-    def reserve_alert(self, watch_name: str, listing: Listing) -> bool:
-        now = datetime.now(UTC).isoformat()
-        cur = self.conn.execute(
-            """INSERT OR IGNORE INTO alert_receipts
-            (watch_name,provider,external_id,alerted_at) VALUES (?,?,?,?)""",
-            (watch_name, listing.provider, listing.external_id, now),
-        )
+        old_price = row["current_price"]
         self.conn.execute(
-            """DELETE FROM alert_candidates
-            WHERE watch_name=? AND provider=? AND external_id=?""",
-            (watch_name, listing.provider, listing.external_id),
+            """UPDATE watch_listing_state
+            SET title=?,url=?,location=?,current_price=?,last_seen_at=?
+            WHERE watch_id=? AND provider=? AND external_id=?""",
+            (
+                listing.title,
+                listing.url,
+                listing.location,
+                listing.price,
+                now,
+                watch_id,
+                listing.provider,
+                listing.external_id,
+            ),
         )
+        kind = "same"
+        if old_price != listing.price:
+            self.conn.execute(
+                """INSERT INTO watch_price_history
+                (watch_id,provider,external_id,price,observed_at) VALUES (?,?,?,?,?)""",
+                (watch_id, listing.provider, listing.external_id, listing.price, now),
+            )
+            if old_price is not None and listing.price is not None:
+                kind = "price_down" if listing.price < old_price else "price_up"
+            else:
+                kind = "price_changed"
         self.conn.commit()
-        return cur.rowcount > 0
+        return Change(kind, old_price, listing.price)
 
-    def queue_alert(self, watch_name: str, listing: Listing, change: Change) -> None:
-        now = datetime.now(UTC).isoformat()
+    def tracking_state(self, watch_id: int, listing: Listing) -> TrackingState | None:
+        row = self.conn.execute(
+            """SELECT first_seen_price,current_price,last_alert_price,alert_count
+            FROM watch_listing_state WHERE watch_id=? AND provider=? AND external_id=?""",
+            (watch_id, listing.provider, listing.external_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return TrackingState(
+            row["first_seen_price"],
+            row["current_price"],
+            row["last_alert_price"],
+            int(row["alert_count"]),
+        )
+
+    def queue_alert(self, watch_id: int, listing: Listing, change: Change) -> None:
+        now = _now()
         self.conn.execute(
-            """INSERT INTO alert_candidates
-            (watch_name,provider,external_id,reason,old_price,new_price,created_at,updated_at)
+            """INSERT INTO pending_alerts
+            (watch_id,provider,external_id,reason,old_price,new_price,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(watch_name,provider,external_id) DO UPDATE SET
-              reason=CASE WHEN excluded.reason='same' THEN alert_candidates.reason
-                          ELSE excluded.reason END,
-              old_price=CASE WHEN excluded.reason='same' THEN alert_candidates.old_price
-                             ELSE excluded.old_price END,
+            ON CONFLICT(watch_id,provider,external_id) DO UPDATE SET
+              reason=excluded.reason,
+              old_price=CASE
+                WHEN pending_alerts.old_price IS NULL THEN excluded.old_price
+                ELSE pending_alerts.old_price END,
               new_price=excluded.new_price,
               updated_at=excluded.updated_at""",
             (
-                watch_name,
+                watch_id,
                 listing.provider,
                 listing.external_id,
                 change.kind,
@@ -423,97 +509,95 @@ class Store:
         )
         self.conn.commit()
 
-    def pending_alert_change(self, watch_name: str, listing: Listing) -> Change | None:
+    def pending_alert_change(self, watch_id: int, listing: Listing) -> Change | None:
         row = self.conn.execute(
-            """SELECT reason,old_price,new_price FROM alert_candidates
-            WHERE watch_name=? AND provider=? AND external_id=?""",
-            (watch_name, listing.provider, listing.external_id),
+            """SELECT reason,old_price,new_price FROM pending_alerts
+            WHERE watch_id=? AND provider=? AND external_id=?""",
+            (watch_id, listing.provider, listing.external_id),
         ).fetchone()
         if row is None:
             return None
         return Change(str(row["reason"]), row["old_price"], row["new_price"])
 
-    def clear_pending_alert(self, watch_name: str, listing: Listing) -> None:
+    def clear_pending_alert(self, watch_id: int, listing: Listing) -> None:
         self.conn.execute(
-            """DELETE FROM alert_candidates
-            WHERE watch_name=? AND provider=? AND external_id=?""",
-            (watch_name, listing.provider, listing.external_id),
+            "DELETE FROM pending_alerts WHERE watch_id=? AND provider=? AND external_id=?",
+            (watch_id, listing.provider, listing.external_id),
         )
         self.conn.commit()
 
-    def observe(self, listing: Listing) -> Change:
-        now = datetime.now(UTC).isoformat()
-        row = self.conn.execute(
-            "SELECT price FROM listings WHERE provider=? AND external_id=?",
-            (listing.provider, listing.external_id),
-        ).fetchone()
-        if row is None:
-            self.conn.execute(
-                "INSERT INTO listings VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    listing.provider,
-                    listing.external_id,
-                    listing.title,
-                    listing.url,
-                    listing.price,
-                    listing.location,
-                    now,
-                    now,
-                ),
+    def mark_alert_delivered(self, watch_id: int, listing: Listing) -> bool:
+        now = _now()
+        with self.conn:
+            cur = self.conn.execute(
+                """UPDATE watch_listing_state
+                SET last_alert_price=?,last_alert_at=?,alert_count=alert_count+1
+                WHERE watch_id=? AND provider=? AND external_id=?""",
+                (listing.price, now, watch_id, listing.provider, listing.external_id),
             )
             self.conn.execute(
-                """INSERT INTO price_history(provider,external_id,price,observed_at)
-                VALUES (?,?,?,?)""",
-                (listing.provider, listing.external_id, listing.price, now),
+                "DELETE FROM pending_alerts WHERE watch_id=? AND provider=? AND external_id=?",
+                (watch_id, listing.provider, listing.external_id),
             )
-            self.conn.commit()
-            return Change("new", None, listing.price)
+        return cur.rowcount > 0
 
-        old_price = row["price"]
-        self.conn.execute(
-            """UPDATE listings SET title=?,url=?,price=?,location=?,last_seen_at=?
-            WHERE provider=? AND external_id=?""",
-            (
-                listing.title,
-                listing.url,
-                listing.price,
-                listing.location,
-                now,
-                listing.provider,
-                listing.external_id,
-            ),
-        )
-        kind = "same"
-        if old_price != listing.price:
-            self.conn.execute(
-                """INSERT INTO price_history(provider,external_id,price,observed_at)
-                VALUES (?,?,?,?)""",
-                (listing.provider, listing.external_id, listing.price, now),
-            )
-            if old_price is not None and listing.price is not None:
-                kind = "price_down" if listing.price < old_price else "price_up"
-            else:
-                kind = "price_changed"
-        self.conn.commit()
-        return Change(kind, old_price, listing.price)
-
-    def is_bootstrapped(self, watch_name: str, provider: str) -> bool:
+    def is_bootstrapped(self, watch_id: int, provider: str) -> bool:
         return (
             self.conn.execute(
-                "SELECT 1 FROM scan_state WHERE watch_name=? AND provider=?",
-                (watch_name, provider),
+                "SELECT 1 FROM watch_scan_state WHERE watch_id=? AND provider=?",
+                (watch_id, provider),
             ).fetchone()
             is not None
         )
 
-    def mark_bootstrapped(self, watch_name: str, provider: str) -> None:
-        now = datetime.now(UTC).isoformat()
+    def mark_bootstrapped(self, watch_id: int, provider: str) -> None:
         self.conn.execute(
-            """INSERT OR IGNORE INTO scan_state(watch_name,provider,bootstrapped_at)
+            """INSERT OR IGNORE INTO watch_scan_state(watch_id,provider,bootstrapped_at)
             VALUES (?,?,?)""",
-            (watch_name, provider, now),
+            (watch_id, provider, _now()),
         )
         self.conn.commit()
+
+    def record_provider_status(
+        self,
+        provider: str,
+        *,
+        started_at: str,
+        duration_seconds: float,
+        jobs: int,
+        errors: int,
+        message: str = "",
+    ) -> None:
+        finished = _now()
+        success = finished if errors == 0 else None
+        self.conn.execute(
+            """INSERT INTO provider_status
+            (provider,last_round_started_at,last_round_finished_at,last_success_at,
+             duration_seconds,jobs,errors,message)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(provider) DO UPDATE SET
+              last_round_started_at=excluded.last_round_started_at,
+              last_round_finished_at=excluded.last_round_finished_at,
+              last_success_at=COALESCE(excluded.last_success_at,provider_status.last_success_at),
+              duration_seconds=excluded.duration_seconds,
+              jobs=excluded.jobs,
+              errors=excluded.errors,
+              message=excluded.message""",
+            (
+                provider,
+                started_at,
+                finished,
+                success,
+                duration_seconds,
+                jobs,
+                errors,
+                message[:500],
+            ),
+        )
+        self.conn.commit()
+
+    def provider_statuses(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
 
     def close(self) -> None:
         self.conn.close()

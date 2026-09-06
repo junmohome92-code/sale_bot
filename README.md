@@ -1,160 +1,179 @@
 # sale_bot
 
-중고나라 · 당근 · 번개장터의 공개 검색 결과를 주기적으로 확인하고, 설정한 가격 범위에 들어오는 매물을 Telegram / Discord / KakaoTalk(선택)으로 알리는 개인용 가격 추적 봇입니다.
+중고나라 · 당근 · 번개장터의 검색 결과를 주기적으로 확인하고, 설정한 가격 조건에 맞는 매물을 Telegram으로 알려주는 개인용 중고매물 감시 봇입니다.
 
-Ubuntu 홈서버에는 **Docker와 Docker Compose만 있으면 됩니다.** Python, Playwright, Chromium 등 실행 의존성은 이미지 안에 설치됩니다.
-
-## 주요 기능
-
-- 감시 키워드 최대 **3슬롯**
-- 상품별 **최소가격 + 최대가격** 설정
-- 제외 키워드(예: `삽니다`, `구매`, `매입`)
-- 동일 watch + 사이트 + 매물 ID는 전달 성공 후 **최초 1회만 알림**
-- 알림 채널이 없거나 일시 실패하면 알림 후보를 보존해 다음 검색에서 재시도
-- 가격 범위 밖 매물도 가격 이력을 관측하므로 나중에 범위로 내려오면 실제 `가격 인하`로 판정
-- 당근 다중 지역 및 **`지역명 전체` 자동 확장**
-- SQLite 매물/가격 이력/감시 설정/알림 상태 저장
-- Docker 상시 실행 및 서버 재부팅 후 자동 재시작
-- 최초 검색 기존 매물을 조용히 기준선으로 잡는 bootstrap 모드
+Ubuntu 홈서버에서는 Docker로 상시 실행하고, 감시 슬롯 추가/수정/삭제는 **Telegram `/menu` 버튼 UI**에서 하는 것을 기본 사용법으로 합니다. Discord는 선택적인 알림 Webhook만 지원합니다.
 
 > 읽기 전용 검색/모니터링만 대상으로 합니다. 로그인·CAPTCHA·봇 차단 우회, 자동 채팅, 자동 구매는 구현하지 않습니다.
 
-## 당근 지역 설정
+## 핵심 동작
 
-특정 지역은 그대로 지정합니다.
+- 감시 슬롯 최대 **20개**
+- 상품별 최소/최대 가격, 제외 키워드, 검색 사이트, 당근 지역 설정
+- 최초 실행 시 이미 있던 매물은 **알림 없이 기준선만 저장**
+- 기준선 이후 새로 조건을 만족한 매물은 알림
+- 같은 매물도 가격이 **1원이라도 내려가면 다시 알림**
+- 같은 가격 반복 발견 / 가격 상승은 알림하지 않음
+- 슬롯별 가격/알림/검색 상태를 독립 저장
+- 슬롯 삭제 시 해당 슬롯의 가격 이력·알림 상태·검색 상태까지 **완전 삭제**
+- 당근 지역은 등록 전에 실제 지역 데이터로 검증
+- 당근 요청은 안전 간격으로 분산하고 403/429/5xx 시 자동 backoff
+- 메모리 캐시는 TTL + 최대 개수 제한으로 장기 실행 시 무한 증가 방지
 
-```yaml
-daangn_regions:
-  - "대전광역시 유성구 봉명동"
-  - "경기도 성남시 분당구 정자동"
-```
+## 가격 알림 예
 
-넓은 범위는 이름 뒤에 `전체`를 붙입니다.
-
-```yaml
-daangn_regions:
-  - "청주시 전체"
-  - "대전시 전체"
-  - "경기도 성남시 전체"
-  - "서울특별시 마포구 전체"
-```
-
-`청주시 전체`만을 위한 하드코딩 목록은 사용하지 않습니다. 실행 시 당근의 현재 region resolver가 반환하는 계층(`name1/name2/name3`, 내부 region id)을 이용해 실제 검색 가능한 하위 지역을 발견하고 batch로 나눕니다.
-
-동명이 겹치는 짧은 범위(예: `중구 전체`)가 여러 도시에 걸리면 임의 선택하지 않고 오류로 처리합니다. 이런 경우 `대전광역시 중구 전체`처럼 상위 지역을 포함해 주세요.
-
-```yaml
-# 넓은 지역의 하위 지역을 몇 묶음으로 나눌지
-daangn_region_batches: 5
-```
-
-예를 들어 polling이 300초이고 5 batch이면 넓은 지역 전체 1회전은 대략 25분입니다. 개별로 지정한 지역은 매 cycle 검사합니다.
-
-이전 설정명 `daangn_full_region_batches`도 호환되지만 새 설정은 `daangn_region_batches`를 권장합니다.
-
-## config.yaml 예시
-
-```yaml
-poll_interval_seconds: 300
-alert_on_first_seen: true
-alert_on_price_increase: false
-bootstrap_silently: true
-request_timeout_seconds: 20
-daangn_region_batches: 5
-
-watches:
-  - name: "닌텐도스위치2"
-    query: "닌텐도스위치2"
-    min_price: 500000
-    max_price: 1200000
-    exclude_keywords:
-      - "삽니다"
-      - "구매"
-      - "매입"
-    providers:
-      - daangn
-      - joongna
-      - bunjang
-    daangn_regions:
-      - "청주시 전체"
-      # - "대전시 전체"
-      # - "경기도 성남시 전체"
-```
-
-`watches`는 SQLite DB가 처음 만들어질 때 seed됩니다. 그 뒤 실제 감시항목은 DB가 기준입니다. YAML의 감시 조건을 바꾼 뒤 Windows 테스트에서 새로 적용하려면 메뉴 7번으로 테스트 DB를 초기화합니다.
-
-기존 DB는 시작 시 `min_price` 컬럼을 자동 추가하고, 같은 이름의 YAML seed 항목에 `min_price`가 있으면 기존 NULL 값에 한 번 backfill합니다.
-
-## 알림 정책
-
-- `bootstrap_silently: true`: 각 provider/당근 batch를 처음 정상 완료할 때 현재 조건 충족 매물을 기준선으로 저장하고 알림하지 않습니다.
-- 당근 batch 중 일부 지역이 실패하면 그 batch는 `baseline-partial`로 남으며 완료 처리하지 않습니다.
-- `alert_on_first_seen: true`: 활성 상태에서 새로 처음 관측되고 가격/제외 조건을 만족하는 매물을 알림 후보로 등록합니다.
-- `alert_on_price_increase: false`: 가격 인상만으로 새 알림 후보를 만들지 않습니다.
-- 가격 하락으로 조건 범위에 들어오는 경우는 알림 후보가 됩니다.
-- 실제 알림 전송이 성공해야 중복방지 receipt를 소모합니다.
-
-로그 예:
+목표 최대가격이 `1,000,000원`인 RX 9070 XT 매물:
 
 ```text
-[daangn] 닌텐도스위치2: fetched=22 matched=4 alerts=0 mode=baseline batch=1/5
+1,200,000원  → 알림 없음
+  990,000원  → 🔔 최초 조건 진입
+  990,000원  → 알림 없음
+  800,000원  → 🔔 가격 하락
+  900,000원  → 알림 없음
+  600,000원  → 🔔 가격 하락
 ```
 
-부분 실패라면:
+알림은 현재가, 이전 가격, 마지막 알림가, 최초 발견가 대비 하락률, 지역, 사이트, 제목, 링크를 보여주는 상세형입니다.
+
+## Telegram 관리
+
+`.env`에 Telegram Bot Token과 Chat ID를 설정한 뒤 봇에서:
 
 ```text
-[daangn] ... mode=baseline-partial batch=1/5 region_errors=1
+/menu
 ```
 
-## Telegram / Discord 관리 명령
+메인 버튼:
 
 ```text
-/add 상품명 | 최대가격 또는 최소~최대 | 당근지역(선택)
+[ ➕ 감시 추가 ] [ 📋 감시 목록 ]
+[ 📊 상태 ]      [ 🔔 알림 테스트 ]
+[ ❓ 도움말 ]
+```
+
+감시 항목을 선택하면 가격 변경, 지역 변경, 일시정지/재개, 완전 삭제가 가능합니다. 삭제는 확인 버튼을 한 번 더 눌러야 합니다.
+
+명령어도 함께 지원합니다.
+
+```text
+/menu
+/add
 /list
+/status
 /price ID 최대가격
 /range ID 최소가격 최대가격
-/region ID 지역1, 지역2, ...
-/exclude ID add 단어
-/exclude ID del 단어
+/region ID 지역
+/exclude ID add|del 단어
 /pause ID
 /resume ID
 /delete ID
 /help
 ```
 
+`/도움말`, `/?`, `도움말`, `메뉴`도 인식합니다.
+
+## 당근 지역 설정
+
+지역은 Telegram에서 입력하면 **저장 전에 당근 지역 해석을 실제로 검증**합니다.
+
 예:
 
 ```text
-/add 스위치2 | 500000~900000 | 대전시 전체, 경기도 성남시 전체
-/range 1 550000 850000
-/region 1 대전시 전체
-/list
+청주시
+청주시 청원구
+청주시 청원구 오창읍
+대전시 유성구
+대전시 유성구 봉명동
 ```
 
-지역을 `/region`으로 바꾸면 해당 watch의 **당근 bootstrap/batch/pending 상태만 초기화**합니다. 이미 성공적으로 보낸 매물의 receipt는 유지하므로 같은 매물 중복알림은 발생시키지 않습니다.
+규칙:
 
-## Windows 테스트
+- `청주시` → 청주시 전체 범위로 검증
+- `청주시 청원구` → 청원구 전체 범위로 검증
+- `대전시 유성구 봉명동` → 해당 동만 검색
+- 없는 지역 → 등록 거부 + 오류 안내
+- `중구`처럼 여러 도시에 존재해 애매한 입력 → 임의 선택하지 않고 상위 지역 입력 요구
 
-저장소 ZIP을 받아 `sale_bot - sale test win` 폴더의 `SALE_TEST.bat`를 실행합니다.
+넓은 지역은 내부적으로 실제 검색 가능한 하위 지역들로 확장합니다. `전체`를 직접 붙여도 됩니다.
 
 ```text
-1. 최초 설치
-2. 코드 테스트
-3. 중고마켓 실제 검색 1회
-4. 계속 실행
-5. 검색 설정 열기 (config.yaml)
-6. 텔레그램/디스코드 설정 열기 (.env)
-7. 설정 변경 적용 / Windows 테스트 DB 초기화
-8. 당근 현재 batch 지역/검색 진단
-9. 당근 '전체' 지역 전수 해석 검증
-0. 종료
+대전시 유성구 전체
+청주시 전체
 ```
 
-- **8번**: 현재 batch만 실제 매물 검색까지 검사합니다.
-- **9번**: `대전시 전체`, `경기도 성남시 전체` 같은 범위가 발견한 모든 하위 지역을 region id로 해석할 수 있는지 검사합니다. 매물 검색/DB/알림은 하지 않습니다.
-- `config.yaml`의 watch 조건을 수정했다면 **7번 → 3번** 순서로 새 설정을 테스트합니다.
+## 검색주기와 당근 요청량
 
-## Ubuntu 홈서버 배포
+기본 목표주기는 **5분**입니다.
+
+```yaml
+poll_interval_seconds: 300
+```
+
+중고나라/번개장터는 각 Provider가 독립적으로 순환합니다. 당근도 독립 루프를 사용하지만, 넓은 지역 × 많은 키워드는 요청 수가 크게 늘기 때문에 한꺼번에 난사하지 않습니다.
+
+당근 요청은 기본적으로 약 **1.2초 이상의 간격**을 두고 순차 분산합니다. 서버가 403/429/5xx를 반환하면 자동으로 요청 간격을 더 늘립니다.
+
+따라서 `20키워드 × 청주시 전체`처럼 매우 큰 작업은 5분 안에 끝났다고 가장하지 않습니다. 한 바퀴가 5분보다 오래 걸리면 쉬지 않고 다음 순환을 이어가며 `/status`에서 실제 최근 순환시간과 오류 수를 확인할 수 있습니다.
+
+## 설정의 기준
+
+운영 중 감시 설정의 Source of Truth는 **SQLite DB**입니다.
+
+- `.env`: Telegram Token, Discord Webhook 같은 비밀값
+- `config.yaml`: 검색 목표주기/timeout + 새 DB의 선택적 최초 seed
+- SQLite: 실제 슬롯, 가격, 지역, 제외어, ON/OFF, 추적/알림 상태
+
+따라서 운영 중에는 YAML을 수정하기보다 Telegram `/menu`로 관리하는 것을 권장합니다.
+
+기본 `config.example.yaml`은 빈 슬롯으로 시작합니다.
+
+```yaml
+poll_interval_seconds: 300
+request_timeout_seconds: 20
+watches: []
+```
+
+## DB 구조와 삭제 정책
+
+추적 상태는 `watch_id + provider + 매물 ID` 기준으로 분리됩니다. 비슷한 두 키워드가 같은 매물을 찾더라도 각 슬롯의 가격변동을 독립적으로 감지합니다.
+
+주요 테이블:
+
+- `managed_watches`: 감시 슬롯 설정
+- `watch_listing_state`: 슬롯별 현재/최초/마지막 알림 가격
+- `watch_price_history`: 실제 가격이 새로 발견되거나 변경됐을 때만 기록
+- `pending_alerts`: 전송 실패/채널 미설정 시 보존할 알림
+- `watch_scan_state`: 최초 기준선 완료 여부
+- `provider_status`: 최근 검색시간/작업수/오류수
+
+슬롯을 삭제하면 해당 `watch_id`에 속하는 상태는 전부 삭제됩니다. 같은 키워드를 나중에 다시 등록하면 새 슬롯처럼 시작합니다.
+
+### 기존 DB 업그레이드
+
+v0.5의 슬롯별 추적 구조로 처음 올라올 때 기존 `managed_watches` 설정은 보존합니다. 다만 과거 버전의 매물/가격 상태는 여러 슬롯 사이에 안전하게 대응시킬 수 없기 때문에 초기화하고 **새로운 조용한 baseline**부터 다시 시작합니다.
+
+## 캐시 정책
+
+당근 지역 데이터는 매번 다시 받지 않도록 메모리에 캐시하지만 상한이 있습니다.
+
+- 지역 후보: 최대 300개 / TTL 6시간
+- 확정 지역: 최대 500개 / TTL 6시간
+- 시·구 전체 확장: 최대 100개 / TTL 6시간
+- Telegram 입력 세션: 10분 TTL / 최대 50개
+
+상한을 넘으면 오래 사용하지 않은 항목부터 제거됩니다. 재시작하면 메모리 캐시는 사라집니다.
+
+## 검색 방식
+
+별도 유료 검색 API Key는 사용하지 않습니다.
+
+- 당근: 현재 웹 서비스가 사용하는 공개 접근 가능한 검색/지역 데이터 요청
+- 중고나라: 검색 페이지의 공개 데이터/HTML 파싱
+- 번개장터: Playwright Chromium으로 공개 검색 페이지 확인
+
+검색 서비스의 구조가 바뀌면 Provider 수정이 필요할 수 있습니다.
+
+## Ubuntu Docker 설치
 
 ```bash
 cd sale_bot
@@ -166,65 +185,49 @@ docker compose ps
 docker compose logs -f --tail=100 sale-bot
 ```
 
-`restart: unless-stopped`가 적용되어 Docker가 부팅 시 시작되는 서버에서는 재부팅 후 컨테이너도 자동으로 올라옵니다.
+DB는 Docker volume의 `/data/sale_bot.sqlite3`에 보존됩니다. `restart: unless-stopped`가 적용되어 Docker가 부팅 시 시작되면 컨테이너도 다시 올라옵니다.
 
-## 알림 / 관리 환경변수
-
-### Telegram
-
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-### Discord 알림
-
-- `DISCORD_WEBHOOK_URL`
-
-### Discord 관리
-
-- `DISCORD_BOT_TOKEN`
-- `DISCORD_ADMIN_USER_ID`
-
-### KakaoTalk (선택)
-
-- `KAKAO_ACCESS_TOKEN`
-
-KakaoTalk 기본 구현은 로그인한 본인의 `나와의 채팅`으로 보내는 방식입니다.
-
-`.env`와 `config.yaml`은 Git에 커밋되지 않도록 제외되어 있습니다.
-
-## 데이터 보존
-
-SQLite DB에는 다음을 저장합니다.
-
-- 감시항목 최대 3개
-- 최소/최대 가격, 당근 지역, 제외 키워드, 일시정지 상태
-- 매물 최초/마지막 발견 시각
-- 현재 가격 및 가격 변경 이력
-- provider/당근 batch별 bootstrap 상태
-- 전달 대기 중인 alert candidate
-- 이미 전달한 watch + provider + 매물 ID receipt
-
-Docker에서는 DB가 `/data/sale_bot.sqlite3`에 있고 named volume에 보존됩니다.
-
-## 수동 1회 점검
+수동 1회 검색:
 
 ```bash
 docker compose run --rm sale-bot python -m sale_bot.main --once
 ```
 
-## 코드 업데이트
+## Windows 테스트
 
-```bash
-git pull
-docker compose up -d --build
+저장소 전체 ZIP을 받은 뒤:
+
+```text
+sale_bot - sale test win\SALE_TEST.bat
 ```
 
-## 개발 검증
+을 실행합니다.
 
-GitHub Actions에서 자동 검증합니다.
+Windows 폴더는 런처/메뉴/진단도구만 보유하고, 실제 Python 코드는 루트 `src/` 한 벌을 그대로 사용합니다. 따라서 Windows 테스트 복사본과 Ubuntu 코드가 서로 달라지는 문제가 없습니다.
 
-- Ruff 정적 검사
-- pytest 단위/회귀 테스트
-- 루트와 Windows 테스트 복사본 핵심 코드 일치 여부
-- Windows `SALE_TEST.bat` 실행 스모크
-- Docker 이미지 빌드
+메뉴:
+
+```text
+1. 최초 설치
+2. 코드 테스트
+3. 중고마켓 실제 검색 1회
+4. 계속 실행
+5. 초기 seed/런타임 설정 열기
+6. 텔레그램/디스코드 알림 설정 열기
+7. Windows 테스트 DB 완전 초기화
+8. 당근 지역/검색 샘플 진단
+9. 당근 '전체' 지역 전수 해석 검증
+0. 종료
+```
+
+## 알림 환경변수
+
+```text
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# 선택
+DISCORD_WEBHOOK_URL=
+```
+
+Discord는 알림 전용이며 설정 관리는 Telegram으로 통일합니다.
