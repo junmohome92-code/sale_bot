@@ -1,8 +1,0 @@
-beautifulsoup4<5,>=4.12
-httpx<1,>=0.28
-playwright<2,>=1.55
-PyYAML<7,>=6
-
-[dev]
-pytest<9,>=8
-ruff<1,>=0.12
