@@ -123,10 +123,43 @@ def _format_ignore_price(value: int) -> str:
     return "사용 안 함" if value <= 0 else f"{value:,}원 이하 무시"
 
 
-def _format_transaction_filters(watch: Watch) -> str:
-    buying = "삽니다 제외" if watch.exclude_buying_posts else "삽니다 허용"
-    selling = "팝니다 제외" if watch.exclude_selling_posts else "팝니다 허용"
+def _format_transaction_selection(
+    exclude_buying_posts: bool, exclude_selling_posts: bool
+) -> str:
+    buying = "삽니다 제외" if exclude_buying_posts else "삽니다 허용"
+    selling = "팝니다 제외" if exclude_selling_posts else "팝니다 허용"
     return f"{buying} · {selling}"
+
+
+def _format_transaction_filters(watch: Watch) -> str:
+    return _format_transaction_selection(
+        watch.exclude_buying_posts, watch.exclude_selling_posts
+    )
+
+
+def _add_transaction_keyboard(
+    exclude_buying_posts: bool, exclude_selling_posts: bool
+) -> dict:
+    buying_text = "✅ 삽니다 제외" if exclude_buying_posts else "⬜ 삽니다 허용"
+    selling_text = "✅ 팝니다 제외" if exclude_selling_posts else "⬜ 팝니다 허용"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": buying_text, "callback_data": "session:add_transaction:buying"},
+                {"text": selling_text, "callback_data": "session:add_transaction:selling"},
+            ],
+            [{"text": "➡️ 다음", "callback_data": "session:add_transaction:next"}],
+            [{"text": "❌ 취소", "callback_data": "session:cancel"}],
+        ]
+    }
+
+
+def _add_transaction_text(exclude_buying_posts: bool, exclude_selling_posts: bool) -> str:
+    return (
+        "🧾 거래유형을 선택해주세요.\n\n"
+        f"현재: {_format_transaction_selection(exclude_buying_posts, exclude_selling_posts)}\n"
+        "버튼으로 제외/허용을 바꾼 뒤 '다음'을 눌러주세요."
+    )
 
 
 def _format_price_range(min_price: int | None, max_price: int | None) -> str:
@@ -441,17 +474,15 @@ async def _handle_session_text(
             await _send(client, token, chat_id, "❌ 0 이상의 가격을 입력해주세요.")
             return True
         session.data["ignore_price_at_or_below"] = ignore_price
-        session.step = "add_region"
+        session.data["exclude_buying_posts"] = True
+        session.data["exclude_selling_posts"] = False
+        session.step = "add_transaction"
         await _send(
             client,
             token,
             chat_id,
-            "📍 당근 지역을 입력해주세요.\n"
-            "한 곳: 청주시 청원구\n"
-            "여러 곳: 청주시, 세종시\n"
-            "또는: 청주시 청원구, 세종시\n\n"
-            "중고나라/번개장터는 입력 지역들의 시 단위로 검색합니다.\n"
-            "지역을 쓰지 않으려면 '건너뛰기'를 입력하세요.",
+            _add_transaction_text(True, False),
+            _add_transaction_keyboard(True, False),
         )
         return True
 
@@ -508,7 +539,7 @@ async def _handle_session_text(
             f"상품: {session.data['name']}\n"
             f"💰 {_format_price_range(session.data['min_price'], session.data['max_price'])}\n"
             f"🚫 무시가격: {_format_ignore_price(session.data['ignore_price_at_or_below'])}\n"
-            "🧾 거래유형: 삽니다 제외 · 팝니다 허용\n"
+            f"🧾 거래유형: {_format_transaction_selection(bool(session.data.get('exclude_buying_posts', True)), bool(session.data.get('exclude_selling_posts', False)))}\n"
             f"📍 당근: {region_text}\n"
             f"🏙 중고나라/번개: {city_preview}\n\n"
             "등록 직후 첫 검색을 시작하고, 조건에 맞는 기존 매물도 "
@@ -655,6 +686,51 @@ async def _handle_callback(
                 chat_id,
                 f"✅ 검색주기를 {seconds // 60}분으로 변경했습니다.",
                 _settings_keyboard(seconds),
+            )
+
+        elif data.startswith("session:add_transaction:"):
+            session = _SESSIONS.get(chat_id)
+            if session is None or session.step != "add_transaction":
+                await _send(
+                    client,
+                    token,
+                    chat_id,
+                    "입력 세션이 만료되었습니다. 다시 추가해주세요.",
+                    _menu_keyboard(),
+                )
+                return
+            action = data.rsplit(":", 1)[1]
+            exclude_buying = bool(session.data.get("exclude_buying_posts", True))
+            exclude_selling = bool(session.data.get("exclude_selling_posts", False))
+            if action == "buying":
+                exclude_buying = not exclude_buying
+            elif action == "selling":
+                exclude_selling = not exclude_selling
+            elif action == "next":
+                session.step = "add_region"
+                await _send(
+                    client,
+                    token,
+                    chat_id,
+                    "📍 당근 지역을 입력해주세요.\n"
+                    "한 곳: 청주시 청원구\n"
+                    "여러 곳: 청주시, 세종시\n"
+                    "또는: 청주시 청원구, 세종시\n\n"
+                    "중고나라/번개장터는 입력 지역들의 시 단위로 검색합니다.\n"
+                    "지역을 쓰지 않으려면 '건너뛰기'를 입력하세요.",
+                )
+                return
+            else:
+                return
+            session.data["exclude_buying_posts"] = exclude_buying
+            session.data["exclude_selling_posts"] = exclude_selling
+            _touch(session)
+            await _send(
+                client,
+                token,
+                chat_id,
+                _add_transaction_text(exclude_buying, exclude_selling),
+                _add_transaction_keyboard(exclude_buying, exclude_selling),
             )
 
         elif data.startswith("watch:"):
@@ -815,6 +891,12 @@ async def _handle_callback(
                 min_price=session.data.get("min_price"),
                 ignore_price_at_or_below=int(
                     session.data.get("ignore_price_at_or_below", 0)
+                ),
+                exclude_buying_posts=bool(
+                    session.data.get("exclude_buying_posts", True)
+                ),
+                exclude_selling_posts=bool(
+                    session.data.get("exclude_selling_posts", False)
                 ),
             )
             name = session.data["name"]

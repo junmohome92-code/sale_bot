@@ -255,3 +255,42 @@ def test_admin_list_and_help_alias(tmp_path, monkeypatch):
 def test_settings_are_minimal_runtime_settings():
     settings = Settings(poll_interval_seconds=300, request_timeout_seconds=20, watches=[])
     assert settings.poll_interval_seconds == 300
+
+
+def test_add_flow_asks_transaction_type_before_region(monkeypatch):
+    sent = []
+
+    async def fake_send(_client, _token, _chat_id, text, markup=None):
+        sent.append((text, markup))
+
+    monkeypatch.setattr(admin, "_send", fake_send)
+    session = admin.AdminSession(step="add_ignore_price", data={})
+    handled = asyncio.run(
+        admin._handle_session_text(object(), "token", "1", "50000", session)
+    )
+
+    assert handled
+    assert session.step == "add_transaction"
+    assert session.data["exclude_buying_posts"] is True
+    assert session.data["exclude_selling_posts"] is False
+    assert "거래유형을 선택" in sent[-1][0]
+    labels = [
+        button["text"]
+        for row in sent[-1][1]["inline_keyboard"]
+        for button in row
+    ]
+    assert "✅ 삽니다 제외" in labels
+    assert "⬜ 팝니다 허용" in labels
+    assert "➡️ 다음" in labels
+
+
+def test_add_transaction_keyboard_can_show_opposite_selection():
+    keyboard = admin._add_transaction_keyboard(False, True)
+    labels = [
+        button["text"]
+        for row in keyboard["inline_keyboard"]
+        for button in row
+    ]
+    assert "⬜ 삽니다 허용" in labels
+    assert "✅ 팝니다 제외" in labels
+    assert admin._format_transaction_selection(False, True) == "삽니다 허용 · 팝니다 제외"
