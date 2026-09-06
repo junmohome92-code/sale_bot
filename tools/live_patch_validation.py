@@ -12,36 +12,7 @@ HEADERS = {
 }
 
 
-def compact(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def locationish(row):
-    return {
-        key: value
-        for key, value in row.items()
-        if any(token in key.lower() for token in ("loc", "region", "area", "addr", "town", "dong"))
-    }
-
-
-def item_summary(payload):
-    data = payload.get("data") or {}
-    rows = data.get("items") or []
-    result = []
-    for row in rows[:5]:
-        if not isinstance(row, dict):
-            continue
-        result.append(
-            {
-                "id": row.get("seq") or row.get("id"),
-                "title": row.get("title"),
-                "locationish": locationish(row),
-            }
-        )
-    return result
-
-
-async def call(client, label, filter_value):
+async def request(client, location_filter):
     body = {
         "searchWord": "닌텐도 스위치2",
         "keywordSource": "INPUT_KEYWORD",
@@ -49,44 +20,108 @@ async def call(client, label, filter_value):
         "page": 0,
         "size": 20,
         "sort": "RECENT_SORT",
-        "filter": filter_value,
+        "filter": {"locationFilter": location_filter},
     }
-    response = await client.post(API, json=body)
-    print("\nCASE", label)
-    print("REQUEST_FILTER", compact(filter_value))
-    print("STATUS", response.status_code)
-    print("BODY_HEAD", response.text[:800].replace("\n", " "))
-    if response.status_code != 200:
-        return
-    payload = response.json()
-    data = payload.get("data") or {}
-    print("TOTAL", data.get("totalSize"), "SIZE", data.get("size"))
-    print("RETURNED_FILTER", compact(data.get("filter"))[:3000])
-    print("ITEMS", compact(item_summary(payload))[:6000])
+    return await client.post(API, json=body)
+
+
+def detail(response):
+    text = response.text.replace("\n", " ")
+    try:
+        payload = response.json()
+        meta = payload.get("meta") or {}
+        details = meta.get("detail") or []
+        if details:
+            return str(details[0].get("message") or details[0])[:1000]
+        if response.status_code == 200:
+            data = payload.get("data") or {}
+            rows = data.get("items") or []
+            locs = []
+            for row in rows[:8]:
+                if isinstance(row, dict):
+                    locs.append(row.get("locationNames"))
+            return f"total={data.get('totalSize')} locs={locs}"
+    except Exception:
+        pass
+    return text[:1000]
 
 
 async def main():
+    # Put an intentionally wrong JSON type under likely field names. A real field should
+    # make Jackson name that field in its path; unknown fields tend to be ignored and
+    # fall through to the service's generic 500 for an empty LocationFilter.
+    field_candidates = [
+        "lat",
+        "lng",
+        "lon",
+        "latitude",
+        "longitude",
+        "distance",
+        "radius",
+        "range",
+        "rangeKm",
+        "distanceKm",
+        "locationId",
+        "locationIds",
+        "locationSeq",
+        "locationSeqs",
+        "regionId",
+        "regionIds",
+        "regionCode",
+        "regionCodes",
+        "code",
+        "codes",
+        "address",
+        "addressName",
+        "locationName",
+        "locationNames",
+        "name",
+        "names",
+        "city",
+        "cityCode",
+        "sido",
+        "sigungu",
+        "emd",
+        "dong",
+        "emdCode",
+        "legalDongCode",
+        "latitudeLongitude",
+        "coordinates",
+        "point",
+        "center",
+    ]
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=HEADERS) as client:
-        await call(client, "baseline", {})
-        candidates = [
-            ("string-city", {"locationFilter": "청주시"}),
-            ("list-city", {"locationFilter": ["청주시"]}),
-            ("list-full-city", {"locationFilter": ["충청북도 청주시"]}),
-            ("object-name", {"locationFilter": {"name": "청주시"}}),
-            ("object-locationName", {"locationFilter": {"locationName": "청주시"}}),
-            ("object-locationNames-list", {"locationFilter": {"locationNames": ["청주시"]}}),
-            ("object-city", {"locationFilter": {"city": "청주시"}}),
-            ("object-value", {"locationFilter": {"value": "청주시"}}),
-            ("list-object-name", {"locationFilter": [{"name": "청주시"}]}),
-            ("list-object-value", {"locationFilter": [{"value": "청주시"}]}),
-            ("string-sejong", {"locationFilter": "세종시"}),
-            ("list-sejong", {"locationFilter": ["세종시"]}),
-        ]
-        for label, value in candidates:
+        for field in field_candidates:
+            # Array/object mismatch is deliberate and makes valid scalar fields obvious.
+            value = {field: {"__probe__": True}}
             try:
-                await call(client, label, value)
+                response = await request(client, value)
+                print(f"FIELD {field} STATUS {response.status_code} DETAIL {detail(response)}")
             except Exception as exc:
-                print("CASE_EXCEPTION", label, repr(exc))
+                print(f"FIELD {field} EXC {exc!r}")
+
+        # Common coordinate object shapes, with Cheongju city-centre-ish coordinates.
+        candidates = [
+            {"latitude": 36.6424, "longitude": 127.4890, "distance": 30},
+            {"latitude": 36.6424, "longitude": 127.4890, "radius": 30},
+            {"lat": 36.6424, "lng": 127.4890, "distance": 30},
+            {"lat": 36.6424, "lng": 127.4890, "radius": 30},
+            {"lat": 36.6424, "lon": 127.4890, "radius": 30},
+        ]
+        for index, value in enumerate(candidates):
+            try:
+                response = await request(client, value)
+                print(
+                    "SHAPE",
+                    index,
+                    json.dumps(value, ensure_ascii=False),
+                    "STATUS",
+                    response.status_code,
+                    "DETAIL",
+                    detail(response),
+                )
+            except Exception as exc:
+                print(f"SHAPE {index} EXC {exc!r}")
 
 
 if __name__ == "__main__":
