@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from .admin import run_telegram_admin
 from .config import load_settings
 from .models import Listing, Watch
-from .notifiers import Notifier, format_message
+from .notifiers import Notifier, format_initial_results, format_message
 from .providers import Provider
 from .region_policy import listing_matches_market_city
 from .runtime_control import (
@@ -21,12 +21,15 @@ from .runtime_control import (
 from .runtime_providers import DaangnRuntimeProvider, build_runtime_providers
 from .storage import Change, Store, TrackingState
 
+INITIAL_RESULT_LIMIT_PER_PROVIDER = 3
+
 
 @dataclass(slots=True)
 class RoundStats:
     jobs: int = 0
     errors: int = 0
     alerts: int = 0
+    initial_results: int = 0
     fetched: int = 0
     matched: int = 0
     baseline_watches: int = 0
@@ -51,15 +54,20 @@ def _should_queue_alert(
     *,
     bootstrapped: bool,
 ) -> bool:
+    del state  # consecutive price events decide alerts; last alert price does not.
     if not bootstrapped or listing.price is None:
         return False
     if change.kind == "new":
         return True
-    if change.kind not in {"price_down", "price_changed"}:
-        return False
-    if state is None or state.last_alert_price is None:
+    if change.kind == "price_down":
         return True
-    return listing.price < state.last_alert_price
+    if (
+        change.kind == "price_changed"
+        and change.old_price is not None
+        and change.new_price is not None
+    ):
+        return change.new_price < change.old_price
+    return False
 
 
 async def _process_listing(
@@ -72,7 +80,7 @@ async def _process_listing(
     *,
     bootstrapped: bool,
 ) -> int:
-    # Daangn uses the detailed configured region. Joongna/Bunjang only use its city.
+    # Daangn uses detailed configured regions. Joongna/Bunjang use configured cities.
     if not listing_matches_market_city(watch, listing):
         return 0
 
@@ -83,7 +91,6 @@ async def _process_listing(
         store.clear_pending_alert(watch_id, listing)
         return 0
 
-    # A pending lower-price alert is stale if the price has risen before delivery.
     if change.kind == "price_up":
         store.clear_pending_alert(watch_id, listing)
         return 0
@@ -99,6 +106,49 @@ async def _process_listing(
     if delivered and store.mark_alert_delivered(watch_id, listing):
         return 1
     return 0
+
+
+def _pick_initial_results(listings: list[Listing]) -> list[Listing]:
+    deduped: dict[str, Listing] = {}
+    for listing in listings:
+        deduped.setdefault(listing.external_id, listing)
+    return sorted(
+        deduped.values(),
+        key=lambda item: (
+            item.price is None,
+            item.price if item.price is not None else 0,
+            item.title.casefold(),
+        ),
+    )[:INITIAL_RESULT_LIMIT_PER_PROVIDER]
+
+
+async def _send_initial_results(
+    store: Store,
+    notifier: Notifier,
+    channels: list[str],
+    watch_id: int,
+    watch: Watch,
+    provider_name: str,
+    matches: list[Listing],
+) -> tuple[int, bool]:
+    """Send one compact first-search message and return (listed_count, success)."""
+    if not matches or not channels:
+        return 0, True
+
+    selected = _pick_initial_results(matches)
+    message = format_initial_results(
+        watch.name,
+        provider_name,
+        selected,
+        total_matched=len({listing.external_id for listing in matches}),
+    )
+    delivered = await notifier.send(message)
+    if not delivered:
+        return 0, False
+
+    for listing in selected:
+        store.mark_alert_delivered(watch_id, listing)
+    return len(selected), True
 
 
 async def _run_daangn_round(
@@ -125,6 +175,8 @@ async def _run_daangn_round(
             watch_alerts = 0
             watch_fetched = 0
             watch_matched = 0
+            initial_matches: list[Listing] = []
+
             for region_name in targets:
                 stats.jobs += 1
                 try:
@@ -134,6 +186,7 @@ async def _run_daangn_round(
                     watch_errors += 1
                     print(f"[daangn] {watch.name} / {region_name or '전체'} failed: {exc}")
                     continue
+
                 for listing in listings:
                     if listing.external_id in seen:
                         continue
@@ -143,6 +196,9 @@ async def _run_daangn_round(
                     if watch.matches(listing):
                         watch_matched += 1
                         stats.matched += 1
+                        if not bootstrapped:
+                            initial_matches.append(listing)
+
                     sent = await _process_listing(
                         store,
                         notifier,
@@ -155,16 +211,33 @@ async def _run_daangn_round(
                     stats.alerts += sent
                     watch_alerts += sent
 
-            if watch_errors == 0:
-                if not bootstrapped:
-                    stats.baseline_watches += 1
+            initial_ok = True
+            initial_count = 0
+            if watch_errors == 0 and not bootstrapped:
+                stats.baseline_watches += 1
+                initial_count, initial_ok = await _send_initial_results(
+                    store,
+                    notifier,
+                    channels,
+                    watch_id,
+                    watch,
+                    "daangn",
+                    initial_matches,
+                )
+                stats.initial_results += initial_count
+
+            if watch_errors == 0 and (bootstrapped or initial_ok):
                 store.mark_bootstrapped(watch_id, "daangn")
-            mode = "active" if bootstrapped else "baseline"
+            elif watch_errors == 0 and not initial_ok:
+                print(f"[daangn] initial-result delivery failed for {watch.name}; retry next round")
+
+            mode = "active" if bootstrapped else "initial"
             if watch_errors:
                 mode += "-partial"
             print(
                 f"[daangn] {watch.name}: targets={len(targets)} fetched={watch_fetched} "
-                f"matched={watch_matched} alerts={watch_alerts} mode={mode} errors={watch_errors}"
+                f"matched={watch_matched} initial={initial_count} alerts={watch_alerts} "
+                f"mode={mode} errors={watch_errors}"
             )
     finally:
         store.close()
@@ -194,12 +267,17 @@ async def _run_simple_round(
 
             watch_matched = 0
             watch_alerts = 0
+            initial_matches: list[Listing] = []
             stats.fetched += len(listings)
+
             for listing in listings:
                 city_ok = listing_matches_market_city(watch, listing)
                 if city_ok and watch.matches(listing):
                     watch_matched += 1
                     stats.matched += 1
+                    if not bootstrapped:
+                        initial_matches.append(listing)
+
                 sent = await _process_listing(
                     store,
                     notifier,
@@ -211,14 +289,35 @@ async def _run_simple_round(
                 )
                 stats.alerts += sent
                 watch_alerts += sent
-            if getattr(provider, "last_search_complete", True):
-                if not bootstrapped:
-                    stats.baseline_watches += 1
+
+            search_complete = bool(getattr(provider, "last_search_complete", True))
+            initial_ok = True
+            initial_count = 0
+            if search_complete and not bootstrapped:
+                stats.baseline_watches += 1
+                initial_count, initial_ok = await _send_initial_results(
+                    store,
+                    notifier,
+                    channels,
+                    watch_id,
+                    watch,
+                    provider_name,
+                    initial_matches,
+                )
+                stats.initial_results += initial_count
+
+            if search_complete and (bootstrapped or initial_ok):
                 store.mark_bootstrapped(watch_id, provider_name)
-            mode = "active" if bootstrapped else "baseline"
+            elif search_complete and not initial_ok:
+                print(
+                    f"[{provider_name}] initial-result delivery failed for "
+                    f"{watch.name}; retry next round"
+                )
+
+            mode = "active" if bootstrapped else "initial"
             print(
                 f"[{provider_name}] {watch.name}: fetched={len(listings)} matched={watch_matched} "
-                f"alerts={watch_alerts} mode={mode}"
+                f"initial={initial_count} alerts={watch_alerts} mode={mode}"
             )
     finally:
         store.close()
@@ -230,6 +329,7 @@ def _stats_message(stats: RoundStats, *, fatal: str | None = None) -> str:
         "fetched": stats.fetched,
         "matched": stats.matched,
         "alerts": stats.alerts,
+        "initial_results": stats.initial_results,
         "baseline_watches": stats.baseline_watches,
     }
     if fatal:
@@ -299,7 +399,7 @@ def _runtime_interval(default: int) -> int:
 
 async def _provider_loop(provider_name: str, provider: Provider, notifier: Notifier) -> None:
     while True:
-        default_interval = 300
+        default_interval = 900
         started = time.monotonic()
         try:
             settings = load_settings(_config_path())
@@ -307,10 +407,11 @@ async def _provider_loop(provider_name: str, provider: Provider, notifier: Notif
             await run_provider_round(provider_name, provider, notifier)
         except Exception as exc:  # noqa: BLE001 - daemon must recover next round
             print(f"[{provider_name}] provider round failed: {exc}")
+
         elapsed = time.monotonic() - started
         interval = _runtime_interval(default_interval)
-        # The configured interval is a target start-to-start cadence. Heavy Daangn
-        # workloads run continuously instead of pretending a citywide round is faster.
+        # The interval is a target start-to-start cadence. Heavy Daangn workloads run
+        # continuously rather than pretending a citywide round is faster than it is.
         await wait_for_scan_or_timeout(provider_name, max(0.0, interval - elapsed))
 
 
@@ -331,7 +432,7 @@ async def run_once() -> None:
     providers = build_runtime_providers(settings.request_timeout_seconds)
     channels = notifier.configured_channels()
     if not channels:
-        print("warning: no notification channel configured; eligible alerts remain pending")
+        print("warning: no notification channel configured; alerts cannot be delivered")
     try:
         await asyncio.gather(
             *(run_provider_round(name, provider, notifier) for name, provider in providers.items())

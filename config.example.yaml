@@ -1,6 +1,7 @@
-# Provider loops target a five-minute refresh. If a Daangn citywide workload itself
-# takes longer than five minutes, it runs continuously and /status shows the real duration.
-poll_interval_seconds: 300
+# Provider loops target a fifteen-minute refresh by default.
+# If a heavy Daangn multi-city workload itself takes longer than the interval,
+# it runs continuously and /status shows the real duration.
+poll_interval_seconds: 900
 request_timeout_seconds: 20
 
 # Runtime watch settings live in SQLite after the first start and are normally managed
@@ -21,4 +22,5 @@ watches: []
 #       - joongna
 #       - bunjang
 #     daangn_regions:
-#       - "청주시 청원구"
+#       - "청주시"
+#       - "세종시"

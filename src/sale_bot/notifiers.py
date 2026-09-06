@@ -6,6 +6,12 @@ import httpx
 from .models import Listing
 from .storage import Change, TrackingState
 
+_PROVIDER_LABELS = {
+    "daangn": "당근",
+    "joongna": "중고나라",
+    "bunjang": "번개장터",
+}
+
 
 @dataclass(slots=True)
 class Message:
@@ -30,11 +36,6 @@ def format_message(
         "price_down": "📉 가격 하락",
         "price_changed": "💱 가격 변경",
     }
-    provider_labels = {
-        "daangn": "당근",
-        "joongna": "중고나라",
-        "bunjang": "번개장터",
-    }
     label = labels.get(change.kind, "🔔 매물 알림")
     price = f"{listing.price:,}원" if listing.price is not None else "가격 미상"
     lines = [f"{label} · {watch_name}", "", f"💰 {price}"]
@@ -48,9 +49,6 @@ def format_message(
         suffix = f" ({drop})" if drop else ""
         lines.append(f"📉 이전 가격: {change.old_price:,}원 → {listing.price:,}원{suffix}")
 
-    if state and state.last_alert_price is not None and state.last_alert_price != listing.price:
-        lines.append(f"🔔 마지막 알림가: {state.last_alert_price:,}원")
-
     if state and state.first_seen_price is not None and listing.price is not None:
         first_drop = _percent_drop(state.first_seen_price, listing.price)
         if first_drop:
@@ -61,9 +59,39 @@ def format_message(
 
     if listing.location:
         lines.append(f"📍 {listing.location}")
-    lines.append(f"🏪 {provider_labels.get(listing.provider, listing.provider)}")
+    lines.append(f"🏪 {_PROVIDER_LABELS.get(listing.provider, listing.provider)}")
     lines.extend(["", listing.title, "", f"🔗 {listing.url}"])
     return Message(text="\n".join(lines), url=listing.url)
+
+
+def format_initial_results(
+    watch_name: str,
+    provider: str,
+    listings: list[Listing],
+    *,
+    total_matched: int,
+) -> Message:
+    """Format one compact first-search message with direct listing links."""
+    provider_label = _PROVIDER_LABELS.get(provider, provider)
+    lines = [
+        f"🔎 초기 검색 결과 · {watch_name}",
+        f"🏪 {provider_label}",
+        f"조건충족 {total_matched}개 · 최저가순 {len(listings)}개 표시",
+        "",
+    ]
+    for index, listing in enumerate(listings, start=1):
+        price = f"{listing.price:,}원" if listing.price is not None else "가격 미상"
+        location = f" · 📍 {listing.location}" if listing.location else ""
+        lines.extend(
+            [
+                f"{index}. 💰 {price}{location}",
+                listing.title,
+                f"🔗 {listing.url}",
+                "",
+            ]
+        )
+    text = "\n".join(lines).rstrip()
+    return Message(text=text, url=listings[0].url if listings else "")
 
 
 class Notifier:

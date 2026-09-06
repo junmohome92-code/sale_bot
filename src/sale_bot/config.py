@@ -40,7 +40,7 @@ def load_settings(path: str | Path) -> Settings:
             raise ValueError(f"watch {watch.name}: min_price cannot exceed max_price")
 
     return Settings(
-        poll_interval_seconds=max(60, int(raw.get("poll_interval_seconds", 300))),
+        poll_interval_seconds=max(60, int(raw.get("poll_interval_seconds", 900))),
         request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
         watches=watches,
     )

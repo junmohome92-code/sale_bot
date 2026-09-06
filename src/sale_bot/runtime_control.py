@@ -8,6 +8,7 @@ _SCAN_EVENTS = {name: asyncio.Event() for name in PROVIDER_NAMES}
 
 
 def request_scan(provider: str | None = None) -> None:
+    """Wake provider loops for internal events such as watch creation or edits."""
     names = (provider,) if provider else PROVIDER_NAMES
     for name in names:
         event = _SCAN_EVENTS.get(name)
@@ -30,7 +31,7 @@ async def wait_for_scan_or_timeout(provider: str, timeout_seconds: float) -> boo
     return True
 
 
-def get_poll_interval(store: Store, default: int = 300) -> int:
+def get_poll_interval(store: Store, default: int = 900) -> int:
     row = store.conn.execute(
         "SELECT value FROM runtime_state WHERE key='poll_interval_seconds'"
     ).fetchone()
