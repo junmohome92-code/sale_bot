@@ -30,6 +30,7 @@ HELP_TEXT = f"""🛒 sale_bot 도움말
 • 이후 새 조건충족 매물 / 실제 가격 하락 시 알림
 • 같은 가격 반복 / 가격 상승은 알림 없음
 • 슬롯별로 'N원 이하 무시' 가격을 설정할 수 있음
+• 삽니다/팝니다 글을 각각 제외 또는 허용할 수 있음
 
 📍 지역 정책
 • 당근: 입력한 시/구/동 범위를 그대로 적용
@@ -120,6 +121,12 @@ def _parse_nonnegative_price(value: str) -> int:
 
 def _format_ignore_price(value: int) -> str:
     return "사용 안 함" if value <= 0 else f"{value:,}원 이하 무시"
+
+
+def _format_transaction_filters(watch: Watch) -> str:
+    buying = "삽니다 제외" if watch.exclude_buying_posts else "삽니다 허용"
+    selling = "팝니다 제외" if watch.exclude_selling_posts else "팝니다 허용"
+    return f"{buying} · {selling}"
 
 
 def _format_price_range(min_price: int | None, max_price: int | None) -> str:
@@ -274,6 +281,7 @@ def _list_text(store: Store) -> str:
             f"#{watch_id} {status} {watch.name}\n"
             f"  💰 {_format_price_range(watch.min_price, watch.max_price)}\n"
             f"  🚫 무시가격: {_format_ignore_price(watch.ignore_price_at_or_below)}\n"
+            f"  🧾 거래유형: {_format_transaction_filters(watch)}\n"
             f"  📍 당근: {daangn_region}\n"
             f"  🏙 중고나라/번개: {market_city_text(watch)}"
         )
@@ -330,14 +338,25 @@ def _watch_list_keyboard(store: Store) -> dict:
     return {"inline_keyboard": rows}
 
 
-def _watch_keyboard(watch_id: int, enabled: bool) -> dict:
+def _watch_keyboard(
+    watch_id: int,
+    enabled: bool,
+    exclude_buying_posts: bool = True,
+    exclude_selling_posts: bool = False,
+) -> dict:
     toggle = "pause" if enabled else "resume"
     toggle_text = "⏸ 일시정지" if enabled else "▶️ 재개"
+    buying_text = "✅ 삽니다 제외" if exclude_buying_posts else "⬜ 삽니다 허용"
+    selling_text = "✅ 팝니다 제외" if exclude_selling_posts else "⬜ 팝니다 허용"
     return {
         "inline_keyboard": [
             [
                 {"text": "💰 가격 변경", "callback_data": f"watch:price:{watch_id}"},
                 {"text": "🚫 무시가격", "callback_data": f"watch:ignore:{watch_id}"},
+            ],
+            [
+                {"text": buying_text, "callback_data": f"watch:buying:{watch_id}"},
+                {"text": selling_text, "callback_data": f"watch:selling:{watch_id}"},
             ],
             [{"text": "📍 지역 변경", "callback_data": f"watch:region:{watch_id}"}],
             [{"text": toggle_text, "callback_data": f"watch:{toggle}:{watch_id}"}],
@@ -489,6 +508,7 @@ async def _handle_session_text(
             f"상품: {session.data['name']}\n"
             f"💰 {_format_price_range(session.data['min_price'], session.data['max_price'])}\n"
             f"🚫 무시가격: {_format_ignore_price(session.data['ignore_price_at_or_below'])}\n"
+            "🧾 거래유형: 삽니다 제외 · 팝니다 허용\n"
             f"📍 당근: {region_text}\n"
             f"🏙 중고나라/번개: {city_preview}\n\n"
             "등록 직후 첫 검색을 시작하고, 조건에 맞는 기존 매물도 "
@@ -652,11 +672,23 @@ async def _handle_callback(
                     f"#{watch_id} {'🟢 감시중' if enabled else '⏸ 일시정지'} · {watch.name}\n\n"
                     f"💰 {_format_price_range(watch.min_price, watch.max_price)}\n"
                     f"🚫 무시가격: {_format_ignore_price(watch.ignore_price_at_or_below)}\n"
+                    f"🧾 거래유형: {_format_transaction_filters(watch)}\n"
                     f"📍 당근: {region}\n"
                     f"🏙 중고나라/번개: {market_city_text(watch)}\n"
                     f"🚫 제외: {excluded}"
                 )
-                await _send(client, token, chat_id, detail, _watch_keyboard(watch_id, enabled))
+                await _send(
+                    client,
+                    token,
+                    chat_id,
+                    detail,
+                    _watch_keyboard(
+                        watch_id,
+                        enabled,
+                        watch.exclude_buying_posts,
+                        watch.exclude_selling_posts,
+                    ),
+                )
                 return
 
             action, watch_id_text = parts[1], parts[2]
@@ -674,6 +706,43 @@ async def _handle_callback(
                     "🚫 새 무시가격을 입력해주세요.\n"
                     "예: 10000 → 10,000원 이하 무시\n"
                     "0 → 사용 안 함",
+                )
+
+            elif action in {"buying", "selling"}:
+                item = store.get_watch(watch_id)
+                if item is None:
+                    await _send(client, token, chat_id, "이미 삭제된 슬롯입니다.")
+                    return
+                watch, enabled = item
+                exclude_buying = watch.exclude_buying_posts
+                exclude_selling = watch.exclude_selling_posts
+                if action == "buying":
+                    exclude_buying = not exclude_buying
+                else:
+                    exclude_selling = not exclude_selling
+                store.set_transaction_filters(
+                    watch_id,
+                    exclude_buying_posts=exclude_buying,
+                    exclude_selling_posts=exclude_selling,
+                )
+                store.reset_watch_tracking(watch_id)
+                updated = store.get_watch(watch_id)
+                assert updated is not None
+                updated_watch, _ = updated
+                request_scan()
+                await _send(
+                    client,
+                    token,
+                    chat_id,
+                    "✅ 거래유형 설정 변경\n"
+                    f"🧾 {_format_transaction_filters(updated_watch)}\n"
+                    "조건을 다시 적용하기 위해 첫 검색을 새로 시작합니다.",
+                    _watch_keyboard(
+                        watch_id,
+                        enabled,
+                        updated_watch.exclude_buying_posts,
+                        updated_watch.exclude_selling_posts,
+                    ),
                 )
 
             elif action == "region":

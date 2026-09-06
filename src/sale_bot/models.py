@@ -6,6 +6,25 @@ ProviderName = Literal["daangn", "joongna", "bunjang"]
 VALID_PROVIDERS = frozenset({"daangn", "joongna", "bunjang"})
 MAX_DAANGN_REGION_SPECS = 10
 
+_BUYING_INTENT_RE = re.compile(
+    r"삽니다|구합니다|구해요|구함|구매\s*(?:합니다|해요|원합니다|원해요)|"
+    r"매입\s*(?:합니다|해요|원합니다|원해요)",
+    re.IGNORECASE,
+)
+_SELLING_INTENT_RE = re.compile(
+    r"팝니다|팔아요|판매\s*(?:합니다|해요|중)|처분\s*(?:합니다|해요)",
+    re.IGNORECASE,
+)
+
+
+def transaction_intent(title: str) -> Literal["buying", "selling", "unknown"]:
+    """Classify obvious transaction-intent phrases in a listing title."""
+    if _BUYING_INTENT_RE.search(title):
+        return "buying"
+    if _SELLING_INTENT_RE.search(title):
+        return "selling"
+    return "unknown"
+
 
 def split_daangn_regions(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
     if not value:
@@ -45,6 +64,8 @@ class Watch:
     min_price: int | None = None
     max_price: int | None = None
     ignore_price_at_or_below: int = 0
+    exclude_buying_posts: bool = True
+    exclude_selling_posts: bool = False
     exclude_keywords: list[str] = field(default_factory=list)
     providers: list[ProviderName] = field(default_factory=lambda: ["daangn", "joongna", "bunjang"])
     daangn_region: str | None = None
@@ -66,6 +87,11 @@ class Watch:
 
     def matches(self, listing: Listing) -> bool:
         title = listing.title.casefold()
+        intent = transaction_intent(listing.title)
+        if self.exclude_buying_posts and intent == "buying":
+            return False
+        if self.exclude_selling_posts and intent == "selling":
+            return False
         if any(word.casefold() in title for word in self.exclude_keywords):
             return False
         if listing.price is None:

@@ -159,6 +159,8 @@ def test_store_migrates_existing_watch_table_and_persists_floor(tmp_path):
             row["name"] for row in store.conn.execute("PRAGMA table_info(managed_watches)").fetchall()
         }
         assert "ignore_price_at_or_below" in columns
+        assert "exclude_buying_posts" in columns
+        assert "exclude_selling_posts" in columns
         watch_id = store.add_watch(
             "switch2",
             1_000_000,
@@ -170,6 +172,14 @@ def test_store_migrates_existing_watch_table_and_persists_floor(tmp_path):
         assert store.set_ignore_price_at_or_below(watch_id, 20_000)
         watch, _ = store.get_watch(watch_id)
         assert watch.ignore_price_at_or_below == 20_000
+        assert watch.exclude_buying_posts is True
+        assert watch.exclude_selling_posts is False
+        assert store.set_transaction_filters(
+            watch_id, exclude_buying_posts=False, exclude_selling_posts=True
+        )
+        watch, _ = store.get_watch(watch_id)
+        assert watch.exclude_buying_posts is False
+        assert watch.exclude_selling_posts is True
     finally:
         store.close()
 
@@ -181,6 +191,8 @@ def test_watch_keyboard_exposes_ignore_price_button():
         for button in row
     ]
     assert "🚫 무시가격" in labels
+    assert "✅ 삽니다 제외" in labels
+    assert "⬜ 팝니다 허용" in labels
 
 
 def test_joongna_api_searches_each_configured_city_and_deduplicates():
