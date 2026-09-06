@@ -1,5 +1,7 @@
+import hashlib
 import json
 import re
+import time
 from abc import ABC, abstractmethod
 from urllib.parse import quote, urljoin
 
@@ -17,53 +19,22 @@ from .models import Listing, Watch
 _PRICE_WITH_WON_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,})\s*원")
 _COMMA_PRICE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+)(?!\d)")
 _ID_RE = re.compile(r"/(?:products?|articles?)/(\d+)")
-
-CHEONGJU_ALL = "청주시 전체"
-CHEONGJU_NEIGHBORHOODS = (
-    "충청북도 청주시 상당구 낭성면",
-    "충청북도 청주시 상당구 미원면",
-    "충청북도 청주시 상당구 가덕면",
-    "충청북도 청주시 상당구 남일면",
-    "충청북도 청주시 상당구 문의면",
-    "충청북도 청주시 상당구 중앙동",
-    "충청북도 청주시 상당구 성안동",
-    "충청북도 청주시 상당구 탑대성동",
-    "충청북도 청주시 상당구 영운동",
-    "충청북도 청주시 상당구 금천동",
-    "충청북도 청주시 상당구 용담.명암.산성동",
-    "충청북도 청주시 상당구 용암1동",
-    "충청북도 청주시 상당구 용암2동",
-    "충청북도 청주시 서원구 남이면",
-    "충청북도 청주시 서원구 현도면",
-    "충청북도 청주시 서원구 사직1동",
-    "충청북도 청주시 서원구 사직2동",
-    "충청북도 청주시 서원구 사창동",
-    "충청북도 청주시 서원구 모충동",
-    "충청북도 청주시 서원구 산남동",
-    "충청북도 청주시 서원구 분평동",
-    "충청북도 청주시 서원구 수곡1동",
-    "충청북도 청주시 서원구 수곡2동",
-    "충청북도 청주시 서원구 성화.개신.죽림동",
-    "충청북도 청주시 흥덕구 오송읍",
-    "충청북도 청주시 흥덕구 강내면",
-    "충청북도 청주시 흥덕구 옥산면",
-    "충청북도 청주시 흥덕구 운천.신봉동",
-    "충청북도 청주시 흥덕구 복대1동",
-    "충청북도 청주시 흥덕구 복대2동",
-    "충청북도 청주시 흥덕구 가경동",
-    "충청북도 청주시 흥덕구 봉명1동",
-    "충청북도 청주시 흥덕구 봉명2.송정동",
-    "충청북도 청주시 흥덕구 강서1동",
-    "충청북도 청주시 흥덕구 강서2동",
-    "충청북도 청주시 청원구 내수읍",
-    "충청북도 청주시 청원구 오창읍",
-    "충청북도 청주시 청원구 북이면",
-    "충청북도 청주시 청원구 우암동",
-    "충청북도 청주시 청원구 내덕1동",
-    "충청북도 청주시 청원구 내덕2동",
-    "충청북도 청주시 청원구 율량.사천동",
-    "충청북도 청주시 청원구 오근장동",
+_ALL_REGION_RE = re.compile(r"^(?P<scope>.+?)\s*전체$")
+_ADMIN_SUFFIXES = (
+    "특별자치시",
+    "특별자치도",
+    "특별시",
+    "광역시",
+    "자치구",
+    "시",
+    "군",
+    "구",
+    "읍",
+    "면",
+    "동",
 )
+_SCOPE_CACHE_TTL_SECONDS = 6 * 60 * 60
+_SCOPE_DISCOVERY_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
 
 def parse_price(text: str | None) -> int | None:
@@ -155,7 +126,7 @@ def _region_parts(region: dict) -> list[str]:
 
 
 def _norm_region(text: str) -> str:
-    return re.sub(r"[\s>]+", "", text).casefold()
+    return re.sub(r"[\s>._·-]+", "", text).casefold()
 
 
 def _region_label(region: dict) -> str:
@@ -165,6 +136,71 @@ def _region_label(region: dict) -> str:
 def _region_leaf(region: str) -> str:
     tokens = [token for token in re.split(r"[\s>]+", region.strip()) if token]
     return tokens[-1] if tokens else region.strip()
+
+
+def _geo_key(text: str) -> str:
+    value = _norm_region(text)
+    for suffix in _ADMIN_SUFFIXES:
+        suffix_key = _norm_region(suffix)
+        if value.endswith(suffix_key) and len(value) > len(suffix_key):
+            return value[: -len(suffix_key)]
+    return value
+
+
+def _geo_tokens(text: str) -> list[str]:
+    tokens = [token for token in re.split(r"[\s>]+", text.strip()) if token]
+    return [key for key in (_geo_key(token) for token in tokens) if key]
+
+
+def _candidate_geo_keys(region: dict) -> set[str]:
+    keys: set[str] = set()
+    for part in _region_parts(region):
+        for token in re.split(r"[\s>]+", part):
+            if token:
+                keys.add(_geo_key(token))
+    return keys
+
+
+def _scope_matches(scope: str, region: dict) -> bool:
+    requested = _geo_tokens(scope)
+    if not requested:
+        return False
+    candidate = _candidate_geo_keys(region)
+    return all(token in candidate for token in requested)
+
+
+def daangn_all_scope(region: str) -> str | None:
+    match = _ALL_REGION_RE.match(region.strip())
+    if not match:
+        return None
+    scope = match.group("scope").strip()
+    return scope or None
+
+
+def has_daangn_all_scope(regions: list[str]) -> bool:
+    return any(daangn_all_scope(region) is not None for region in regions)
+
+
+def daangn_scope_key(regions: list[str]) -> str:
+    scopes = sorted(
+        _norm_region(scope)
+        for region in regions
+        if (scope := daangn_all_scope(region)) is not None
+    )
+    payload = "|".join(scopes)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _scope_query_terms(scope: str) -> list[str]:
+    terms: list[str] = []
+    raw_tokens = [token for token in re.split(r"[\s>]+", scope.strip()) if token]
+    for candidate in [scope.strip(), *reversed(raw_tokens)]:
+        if candidate and candidate not in terms:
+            terms.append(candidate)
+        key = _geo_key(candidate)
+        if key and key not in terms:
+            terms.append(key)
+    return terms
 
 
 def _select_region(requested: str, locations: list[dict]) -> dict:
@@ -177,19 +213,23 @@ def _select_region(requested: str, locations: list[dict]) -> dict:
 
     requested_tokens = [token for token in re.split(r"[\s>]+", requested.strip()) if token]
     if len(requested_tokens) >= 2:
+        contextual = [item for item in locations if _scope_matches(requested, item)]
+        leaf_norm = _norm_region(_region_leaf(requested))
         contextual = [
             item
-            for item in locations
-            if all(
-                _norm_region(token) in _norm_region(" ".join(_region_parts(item)))
-                for token in requested_tokens
-            )
+            for item in contextual
+            if leaf_norm
+            in {
+                _norm_region(str(item.get("name") or "")),
+                _norm_region(str(item.get("name3") or "")),
+            }
         ]
         if len(contextual) == 1:
             return contextual[0]
         if len(contextual) > 1:
             labels = ", ".join(_region_label(item) for item in contextual[:5])
             raise RuntimeError(f"Daangn region ambiguous: {requested} -> {labels}")
+        raise RuntimeError(f"Daangn region not found in requested context: {requested}")
 
     leaf_norm = _norm_region(_region_leaf(requested))
     leaf_exact = [
@@ -212,6 +252,10 @@ def _select_region(requested: str, locations: list[dict]) -> dict:
 class Provider(ABC):
     name: str
 
+    def __init__(self) -> None:
+        self.last_search_complete = True
+        self.last_search_errors: list[str] = []
+
     @abstractmethod
     async def search(self, watch: Watch) -> list[Listing]: ...
 
@@ -223,13 +267,16 @@ class JoongnaProvider(Provider):
     name = "joongna"
 
     def __init__(self, timeout: int = 20):
+        super().__init__()
         self.client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor"},
+            headers={"User-Agent": "Mozilla/5.0 sale_bot/0.4 personal-monitor"},
         )
 
     async def search(self, watch: Watch) -> list[Listing]:
+        self.last_search_complete = True
+        self.last_search_errors = []
         url = f"https://web.joongna.com/search/{quote(watch.query)}"
         response = await self.client.get(url)
         response.raise_for_status()
@@ -293,46 +340,157 @@ class DaangnProvider(Provider):
     name = "daangn"
 
     def __init__(self, timeout: int = 20):
+        super().__init__()
         self.client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers={
-                "User-Agent": "Mozilla/5.0 sale_bot/0.3 personal-monitor",
+                "User-Agent": "Mozilla/5.0 sale_bot/0.4 personal-monitor",
                 "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
             },
         )
         self._region_cache: dict[str, dict] = {}
+        self._candidate_cache: dict[str, list[dict]] = {}
+        self.last_scope_expansions: dict[str, list[str]] = {}
+        self.last_search_target_count = 0
+
+    async def _region_candidates(self, keyword: str) -> list[dict]:
+        keyword = keyword.strip()
+        if keyword in self._candidate_cache:
+            return self._candidate_cache[keyword]
+        response = await self.client.get(
+            "https://www.daangn.com/kr/api/v1/regions/keyword",
+            params={"keyword": keyword},
+        )
+        response.raise_for_status()
+        locations = [
+            item for item in (response.json().get("locations") or []) if isinstance(item, dict)
+        ]
+        self._candidate_cache[keyword] = locations
+        return locations
 
     async def _resolve_region(self, region: str) -> dict:
         if region in self._region_cache:
             return self._region_cache[region]
-        response = await self.client.get(
-            "https://www.daangn.com/kr/api/v1/regions/keyword",
-            params={"keyword": _region_leaf(region)},
-        )
-        response.raise_for_status()
-        locations = response.json().get("locations") or []
+        locations = await self._region_candidates(_region_leaf(region))
         if not locations:
             raise RuntimeError(f"Daangn region not found: {region}")
-        selected = _select_region(region, [item for item in locations if isinstance(item, dict)])
+        selected = _select_region(region, locations)
         self._region_cache[region] = selected
         return selected
 
-    def region_targets(self, watch: Watch) -> list[str | None]:
-        explicit = [region for region in watch.daangn_regions if region != CHEONGJU_ALL]
+    async def _discover_scope_regions(self, scope: str) -> list[dict]:
+        cache_key = _norm_region(scope)
+        cached = _SCOPE_DISCOVERY_CACHE.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < _SCOPE_CACHE_TTL_SECONDS:
+            regions = [dict(item) for item in cached[1]]
+            for item in regions:
+                self._region_cache[_region_label(item).replace(" > ", " ")] = item
+            return regions
+
+        seeds: dict[tuple[object, object, object], dict] = {}
+        for term in _scope_query_terms(scope):
+            for item in await self._region_candidates(term):
+                if int(item.get("depth") or 0) not in {2, 3}:
+                    continue
+                if not _scope_matches(scope, item):
+                    continue
+                key = (
+                    item.get("name1Id"),
+                    item.get("name2Id"),
+                    item.get("name3Id") or item.get("id"),
+                )
+                seeds[key] = item
+
+        if not seeds:
+            raise RuntimeError(f"Daangn broad region not found: {scope} 전체")
+
+        if len(_geo_tokens(scope)) == 1:
+            parents = {
+                (_geo_key(str(item.get("name1") or "")), _geo_key(str(item.get("name2") or "")))
+                for item in seeds.values()
+            }
+            provinces = {parent[0] for parent in parents}
+            if len(provinces) > 1:
+                labels = ", ".join(_region_label(item) for item in list(seeds.values())[:5])
+                raise RuntimeError(f"Daangn broad region ambiguous: {scope} 전체 -> {labels}")
+
+        group_seeds: dict[object, dict] = {}
+        direct_depth3: dict[object, dict] = {}
+        for item in seeds.values():
+            if int(item.get("depth") or 0) == 3:
+                direct_depth3[item.get("name3Id") or item.get("id")] = item
+            group_key = item.get("name2Id") or item.get("name2")
+            if group_key is not None:
+                group_seeds[group_key] = item
+
+        discovered: dict[object, dict] = dict(direct_depth3)
+        for group_key, seed in group_seeds.items():
+            name2 = str(seed.get("name2") or seed.get("name") or "").strip()
+            terms = [name2, _region_leaf(name2), _geo_key(_region_leaf(name2))]
+            for term in dict.fromkeys(term for term in terms if term):
+                for item in await self._region_candidates(term):
+                    if int(item.get("depth") or 0) != 3:
+                        continue
+                    item_group = item.get("name2Id") or item.get("name2")
+                    if item_group != group_key or not _scope_matches(scope, item):
+                        continue
+                    discovered[item.get("name3Id") or item.get("id")] = item
+
+        if not discovered:
+            raise RuntimeError(f"Daangn broad region has no searchable neighborhoods: {scope} 전체")
+
+        regions = sorted(
+            discovered.values(),
+            key=lambda item: (
+                str(item.get("name1") or ""),
+                str(item.get("name2") or ""),
+                str(item.get("name3") or item.get("name") or ""),
+            ),
+        )
+        for item in regions:
+            self._region_cache[_region_label(item).replace(" > ", " ")] = item
+        _SCOPE_DISCOVERY_CACHE[cache_key] = (now, [dict(item) for item in regions])
+        return regions
+
+    async def region_targets(self, watch: Watch) -> list[str | None]:
+        explicit: list[str] = []
+        broad_specs: list[tuple[str, str]] = []
+        for region in watch.daangn_regions:
+            scope = daangn_all_scope(region)
+            if scope is None:
+                explicit.append(region)
+            else:
+                broad_specs.append((region, scope))
+
         targets: list[str | None] = list(explicit)
-        if CHEONGJU_ALL in watch.daangn_regions:
-            batch_count = max(
-                1,
-                min(int(watch.daangn_batch_count), len(CHEONGJU_NEIGHBORHOODS)),
-            )
+        self.last_scope_expansions = {}
+        for original, scope in broad_specs:
+            discovered = await self._discover_scope_regions(scope)
+            labels = [_region_label(item).replace(" > ", " ") for item in discovered]
+            self.last_scope_expansions[original] = labels
+            batch_count = max(1, min(int(watch.daangn_batch_count), len(labels)))
             batch_index = int(watch.daangn_batch_index) % batch_count
-            city_batch = [
-                region
-                for index, region in enumerate(CHEONGJU_NEIGHBORHOODS)
-                if index % batch_count == batch_index
-            ]
-            targets.extend(city_batch)
+            targets.extend(
+                label for index, label in enumerate(labels) if index % batch_count == batch_index
+            )
+        if not targets:
+            return [None]
+        return list(dict.fromkeys(targets))
+
+    async def all_region_targets(self, watch: Watch) -> list[str | None]:
+        targets: list[str | None] = []
+        self.last_scope_expansions = {}
+        for region in watch.daangn_regions:
+            scope = daangn_all_scope(region)
+            if scope is None:
+                targets.append(region)
+                continue
+            discovered = await self._discover_scope_regions(scope)
+            labels = [_region_label(item).replace(" > ", " ") for item in discovered]
+            self.last_scope_expansions[region] = labels
+            targets.extend(labels)
         if not targets:
             return [None]
         return list(dict.fromkeys(targets))
@@ -383,22 +541,26 @@ class DaangnProvider(Provider):
         return list(results.values())
 
     async def search(self, watch: Watch) -> list[Listing]:
+        self.last_search_complete = True
+        self.last_search_errors = []
         results: dict[str, Listing] = {}
-        errors: list[str] = []
+        targets = await self.region_targets(watch)
+        self.last_search_target_count = len(targets)
         successful_searches = 0
-        for region_name in self.region_targets(watch):
+        for region_name in targets:
             try:
                 articles = await self._fetch_articles(watch, region_name)
             except Exception as exc:  # noqa: BLE001 - one region should not block others
-                errors.append(f"{region_name or '전체'}: {exc}")
+                self.last_search_errors.append(f"{region_name or '전체'}: {exc}")
                 continue
             successful_searches += 1
             for listing in self._parse_articles(articles):
                 results[listing.external_id] = listing
-        if successful_searches == 0 and errors:
-            raise RuntimeError("Daangn search failed: " + "; ".join(errors))
-        if errors:
-            print("[daangn] partial region failure: " + "; ".join(errors))
+        self.last_search_complete = not self.last_search_errors
+        if successful_searches == 0 and self.last_search_errors:
+            raise RuntimeError("Daangn search failed: " + "; ".join(self.last_search_errors))
+        if self.last_search_errors:
+            print("[daangn] partial region failure: " + "; ".join(self.last_search_errors))
         return list(results.values())
 
     async def close(self) -> None:
@@ -409,6 +571,7 @@ class BunjangProvider(Provider):
     name = "bunjang"
 
     def __init__(self, timeout: int = 20):
+        super().__init__()
         self.timeout_ms = timeout * 1000
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -421,6 +584,8 @@ class BunjangProvider(Provider):
         return self._browser
 
     async def search(self, watch: Watch) -> list[Listing]:
+        self.last_search_complete = True
+        self.last_search_errors = []
         url = f"https://m.bunjang.co.kr/search/products?order=date&page=1&q={quote(watch.query)}"
         browser = await self._ensure_browser()
         page = await browser.new_page(locale="ko-KR", viewport={"width": 430, "height": 932})
