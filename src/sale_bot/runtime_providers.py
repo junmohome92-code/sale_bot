@@ -8,6 +8,7 @@ from . import providers as legacy
 from .cache import BoundedTTLCache
 from .models import Listing, Watch
 from .providers import Provider, daangn_all_scope
+from .region_policy import city_labels_from_regions
 
 # Keep Daangn's process-global broad-region cache bounded on long-running servers.
 legacy._SCOPE_DISCOVERY_CACHE = BoundedTTLCache(maxsize=100, ttl_seconds=6 * 60 * 60)
@@ -47,6 +48,14 @@ def _location_text(row: dict) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _joongna_search_terms(watch: Watch) -> list[str]:
+    """Use Joongna's own search index to narrow results by configured city."""
+    cities = city_labels_from_regions(watch.daangn_regions)
+    if not cities:
+        return [watch.query]
+    return [f"{city} {watch.query}" for city in cities]
 
 
 @dataclass(slots=True)
@@ -169,7 +178,7 @@ class DaangnRuntimeProvider(legacy.DaangnProvider):
 
 
 class JoongnaRuntimeProvider(Provider):
-    """Current Joongna JSON search API with structured seller location metadata."""
+    """Joongna JSON search API using city-prefixed queries plus structured locations."""
 
     name = "joongna"
 
@@ -233,32 +242,35 @@ class JoongnaRuntimeProvider(Provider):
         self.last_search_complete = True
         self.last_search_errors = []
         results: dict[str, Listing] = {}
-        for page in range(JOONGNA_SEARCH_PAGES):
-            body = {
-                "searchWord": watch.query,
-                "keywordSource": "INPUT_KEYWORD",
-                "actionDetailType": "NONE",
-                "page": page,
-                "size": JOONGNA_PAGE_SIZE,
-                "sort": "RECENT_SORT",
-                "filter": {},
-            }
-            try:
-                response = await self.client.post(JOONGNA_SEARCH_API, json=body)
-                response.raise_for_status()
-                rows = self._rows(response.json())
-            except Exception as exc:
-                self.last_search_complete = False
-                self.last_search_errors.append(f"page {page}: {exc}")
-                if not results:
-                    raise
-                break
-            if not rows:
-                break
-            for row in rows:
-                listing = self._parse_row(row)
-                if listing is not None:
-                    results[listing.external_id] = listing
+        for search_term in _joongna_search_terms(watch):
+            for page in range(JOONGNA_SEARCH_PAGES):
+                body = {
+                    "searchWord": search_term,
+                    "keywordSource": "INPUT_KEYWORD",
+                    "actionDetailType": "NONE",
+                    "page": page,
+                    "size": JOONGNA_PAGE_SIZE,
+                    "sort": "RECENT_SORT",
+                    "filter": {},
+                }
+                try:
+                    response = await self.client.post(JOONGNA_SEARCH_API, json=body)
+                    response.raise_for_status()
+                    rows = self._rows(response.json())
+                except Exception as exc:
+                    self.last_search_complete = False
+                    self.last_search_errors.append(f"{search_term} page {page}: {exc}")
+                    if not results:
+                        raise
+                    break
+                if not rows:
+                    break
+                for row in rows:
+                    listing = self._parse_row(row)
+                    if listing is not None:
+                        results[listing.external_id] = listing
+                if len(rows) < JOONGNA_PAGE_SIZE:
+                    break
         return list(results.values())
 
     async def close(self) -> None:
