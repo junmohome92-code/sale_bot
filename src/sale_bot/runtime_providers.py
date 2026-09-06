@@ -1,6 +1,7 @@
 import asyncio
 import time
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import httpx
 
@@ -8,6 +9,7 @@ from . import providers as legacy
 from .cache import BoundedTTLCache
 from .models import Listing, Watch
 from .providers import BunjangProvider, JoongnaProvider, Provider, daangn_all_scope
+from .region_policy import city_keys_from_watch
 
 # Keep Daangn's process-global broad-region cache bounded on long-running servers.
 legacy._SCOPE_DISCOVERY_CACHE = BoundedTTLCache(maxsize=100, ttl_seconds=6 * 60 * 60)
@@ -132,9 +134,86 @@ class DaangnRuntimeProvider(legacy.DaangnProvider):
         return RegionValidation(canonical=canonical, target_count=1, broad=False)
 
 
+class BunjangRuntimeProvider(BunjangProvider):
+    """Bunjang browser search that also captures city metadata from result cards."""
+
+    async def search(self, watch: Watch) -> list[Listing]:
+        self.last_search_complete = True
+        self.last_search_errors = []
+        url = f"https://m.bunjang.co.kr/search/products?order=date&page=1&q={quote(watch.query)}"
+        browser = await self._ensure_browser()
+        page = await browser.new_page(locale="ko-KR", viewport={"width": 430, "height": 932})
+        city_keys = city_keys_from_watch(watch)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            try:
+                await page.wait_for_selector(
+                    'a[href*="/products/"]', timeout=min(7000, self.timeout_ms)
+                )
+            except legacy.PlaywrightTimeoutError:
+                body = (await page.locator("body").inner_text()).strip()
+                if body and any(
+                    word in body for word in ("검색 결과가 없습니다", "검색결과가 없습니다")
+                ):
+                    return []
+                raise RuntimeError(
+                    "Bunjang search cards did not load; page structure or access may have changed"
+                )
+            cards = await page.locator('a[href*="/products/"]').evaluate_all(
+                r"""
+                (els, cityKeys) => els.map(a => {
+                  const texts = [...a.querySelectorAll('div,span,p')]
+                    .map(n => (n.textContent || '').trim())
+                    .filter(Boolean);
+                  const title = a.querySelector('img')?.alt || texts[0] || '';
+                  const priceText = texts.find(t => /^\d{1,3}(,\d{3})+\s*원?$/.test(t))
+                    || texts.find(t => /^\d{4,}\s*원$/.test(t)) || '';
+                  const compact = value => value.replace(/[\s>._·-]+/g, '').toLowerCase();
+                  const locationText = cityKeys.length
+                    ? texts.find(t => t !== title && t.length <= 40
+                        && !/^\d/.test(t) && !t.includes('원')
+                        && cityKeys.some(key => compact(t).includes(key))) || null
+                    : null;
+                  return {
+                    href: a.href,
+                    text: (a.innerText || '').trim(),
+                    title,
+                    priceText,
+                    image: a.querySelector('img')?.src || null,
+                    locationText
+                  };
+                })
+                """,
+                city_keys,
+            )
+        finally:
+            await page.close()
+
+        results: dict[str, Listing] = {}
+        for card in cards:
+            href = str(card.get("href") or "")
+            item_id = legacy.stable_id_from_url(href)
+            if not item_id:
+                continue
+            price = legacy.parse_price(str(card.get("priceText") or ""))
+            if price is None:
+                price = legacy.parse_price(str(card.get("text") or ""))
+            location = card.get("locationText")
+            results[item_id] = Listing(
+                "bunjang",
+                item_id,
+                str(card.get("title") or "번개장터 매물").strip(),
+                price,
+                href,
+                location=str(location) if location else None,
+                image_url=str(card.get("image")) if card.get("image") else None,
+            )
+        return list(results.values())
+
+
 def build_runtime_providers(timeout: int) -> dict[str, Provider]:
     return {
         "daangn": DaangnRuntimeProvider(timeout),
         "joongna": JoongnaProvider(timeout),
-        "bunjang": BunjangProvider(timeout),
+        "bunjang": BunjangRuntimeProvider(timeout),
     }
