@@ -177,7 +177,7 @@ def test_legacy_database_migrates_to_clean_watch_scoped_baseline(tmp_path):
         version = store.conn.execute(
             "SELECT value FROM runtime_state WHERE key='schema_version'"
         ).fetchone()[0]
-        assert version == "2"
+        assert version == "3"
         for old_table in (
             "listings",
             "price_history",
