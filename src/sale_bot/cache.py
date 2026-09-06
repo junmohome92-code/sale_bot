@@ -1,13 +1,10 @@
 from collections import OrderedDict
 from time import monotonic
-from typing import Generic, TypeVar
 
-K = TypeVar("K")
-V = TypeVar("V")
 _MISSING = object()
 
 
-class BoundedTTLCache(Generic[K, V]):
+class BoundedTTLCache[K, V]:
     """Small in-memory TTL+LRU cache with a hard item cap."""
 
     def __init__(self, maxsize: int, ttl_seconds: float):
