@@ -1,86 +1,38 @@
 import asyncio
-import json
 
-import httpx
-
-API = "https://search-api.joongna.com/v3/search/all"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "Origin": "https://web.joongna.com",
-    "Referer": "https://web.joongna.com/",
-}
+from sale_bot.models import Watch
+from sale_bot.region_policy import listing_matches_market_city
+from sale_bot.runtime_providers import BunjangRuntimeProvider, JoongnaRuntimeProvider
 
 
-def city_match(location_names, city):
-    needle = city.replace(" ", "")
-    aliases = {needle}
-    if needle == "청주시":
-        aliases.update({"충청북도청주시", "충북청주시"})
-    if needle in {"세종시", "세종특별자치시"}:
-        aliases.update({"세종시", "세종특별자치시"})
-    for value in location_names or []:
-        compact = str(value).replace(" ", "")
-        if any(alias in compact for alias in aliases):
-            return True
-    return False
-
-
-async def search(client, search_word, city):
-    body = {
-        "searchWord": search_word,
-        "keywordSource": "INPUT_KEYWORD",
-        "actionDetailType": "NONE",
-        "page": 0,
-        "size": 50,
-        "sort": "RECENT_SORT",
-        "filter": {},
-    }
-    response = await client.post(API, json=body)
-    print("\nQUERY", search_word, "STATUS", response.status_code)
-    payload = response.json()
-    data = payload.get("data") or {}
-    rows = data.get("items") or []
-    print("TOTAL", data.get("totalSize"), "RETURNED", len(rows))
-
-    known = 0
-    matched = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        location_names = row.get("locationNames") or []
-        main_location = row.get("mainLocationName")
-        if location_names or main_location:
-            known += 1
-        if city_match(location_names, city) or city_match([main_location] if main_location else [], city):
-            matched.append(row)
-
-    print("LOCATION_KNOWN", known, "CITY_MATCH", len(matched))
-    for row in matched[:10]:
+async def validate(name, provider, watch):
+    try:
+        rows = await provider.search(watch)
+        city_rows = [row for row in rows if listing_matches_market_city(watch, row)]
+        final_rows = [row for row in city_rows if watch.matches(row)]
         print(
-            json.dumps(
-                {
-                    "id": row.get("seq") or row.get("id"),
-                    "title": row.get("title"),
-                    "price": row.get("price"),
-                    "mainLocationName": row.get("mainLocationName"),
-                    "locationNames": row.get("locationNames"),
-                },
-                ensure_ascii=False,
-            )
+            f"[{name}] fetched={len(rows)} city_match={len(city_rows)} "
+            f"final={len(final_rows)} complete={provider.last_search_complete}"
         )
+        for row in sorted(final_rows, key=lambda item: item.price or 10**18)[:10]:
+            print(
+                f"[{name}] MATCH price={row.price} location={row.location} "
+                f"title={row.title} url={row.url}"
+            )
+    finally:
+        await provider.close()
 
 
 async def main():
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=HEADERS) as client:
-        for query, city in [
-            ("닌텐도 스위치2", "청주시"),
-            ("청주시 닌텐도 스위치2", "청주시"),
-            ("청주 닌텐도 스위치2", "청주시"),
-            ("세종시 닌텐도 스위치2", "세종시"),
-            ("세종 닌텐도 스위치2", "세종시"),
-        ]:
-            await search(client, query, city)
+    watch = Watch(
+        name="닌텐도 스위치2",
+        query="닌텐도 스위치2",
+        max_price=1_000_000,
+        ignore_price_at_or_below=10_000,
+        daangn_regions=["청주시 전체", "세종시 전체"],
+    )
+    await validate("joongna", JoongnaRuntimeProvider(timeout=30), watch)
+    await validate("bunjang", BunjangRuntimeProvider(timeout=30), watch)
 
 
 if __name__ == "__main__":
