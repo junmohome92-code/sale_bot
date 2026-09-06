@@ -1,0 +1,35 @@
+name: apply-add-flow-transaction-selection
+
+on:
+  push:
+    branches:
+      - fix/add-flow-transaction-selection
+    paths:
+      - tools/apply_add_flow_transaction_selection.py
+      - .github/workflows/apply-add-flow-transaction-selection.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/add-flow-transaction-selection
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/apply_add_flow_transaction_selection.py
+      - run: pip install -e .[dev]
+      - run: ruff check src tests
+      - run: pytest -q
+      - name: Commit patched sources
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/sale_bot/admin.py tests/test_core.py
+          git diff --cached --check
+          git commit -m 'fix: choose transaction filters during watch setup'
+          git push
