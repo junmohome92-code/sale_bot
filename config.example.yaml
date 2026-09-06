@@ -14,6 +14,8 @@ watches: []
 #     query: "RX 9070 XT"
 #     max_price: 1000000
 #     ignore_price_at_or_below: 10000
+#     exclude_buying_posts: true
+#     exclude_selling_posts: false
 #     exclude_keywords:
 #       - "삽니다"
 #       - "구매"

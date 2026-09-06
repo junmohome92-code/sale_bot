@@ -7,7 +7,7 @@ from pathlib import Path
 from .models import Listing, Watch, split_daangn_regions
 
 MAX_WATCH_SLOTS = 20
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -75,6 +75,8 @@ class Store:
               min_price INTEGER,
               max_price INTEGER NOT NULL,
               ignore_price_at_or_below INTEGER NOT NULL DEFAULT 0,
+              exclude_buying_posts INTEGER NOT NULL DEFAULT 1,
+              exclude_selling_posts INTEGER NOT NULL DEFAULT 0,
               exclude_keywords TEXT NOT NULL DEFAULT '[]',
               providers TEXT NOT NULL,
               daangn_region TEXT,
@@ -175,6 +177,16 @@ class Store:
                 "ALTER TABLE managed_watches ADD COLUMN "
                 "ignore_price_at_or_below INTEGER NOT NULL DEFAULT 0"
             )
+        if "exclude_buying_posts" not in columns:
+            self.conn.execute(
+                "ALTER TABLE managed_watches ADD COLUMN "
+                "exclude_buying_posts INTEGER NOT NULL DEFAULT 1"
+            )
+        if "exclude_selling_posts" not in columns:
+            self.conn.execute(
+                "ALTER TABLE managed_watches ADD COLUMN "
+                "exclude_selling_posts INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _migrate_to_watch_scoped_tracking(self, previous_version: int) -> None:
         # Legacy state used only provider+listing id. It cannot be mapped safely to
@@ -220,14 +232,16 @@ class Store:
                 continue
             self.conn.execute(
                 """INSERT OR IGNORE INTO managed_watches
-                (name,query,min_price,max_price,ignore_price_at_or_below,exclude_keywords,providers,daangn_region,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (name,query,min_price,max_price,ignore_price_at_or_below,exclude_buying_posts,exclude_selling_posts,exclude_keywords,providers,daangn_region,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     watch.name,
                     watch.query,
                     watch.min_price,
                     watch.max_price,
                     watch.ignore_price_at_or_below,
+                    int(watch.exclude_buying_posts),
+                    int(watch.exclude_selling_posts),
                     json.dumps(watch.exclude_keywords, ensure_ascii=False),
                     json.dumps(watch.providers),
                     _encode_regions(watch.daangn_regions),
@@ -247,6 +261,8 @@ class Store:
             min_price=int(row["min_price"]) if row["min_price"] is not None else None,
             max_price=int(row["max_price"]),
             ignore_price_at_or_below=int(row["ignore_price_at_or_below"] or 0),
+            exclude_buying_posts=bool(row["exclude_buying_posts"]),
+            exclude_selling_posts=bool(row["exclude_selling_posts"]),
             exclude_keywords=json.loads(row["exclude_keywords"]),
             providers=json.loads(row["providers"]),
             daangn_regions=_decode_regions(row["daangn_region"]),
@@ -279,6 +295,8 @@ class Store:
         *,
         min_price: int | None = None,
         ignore_price_at_or_below: int = 0,
+        exclude_buying_posts: bool = True,
+        exclude_selling_posts: bool = False,
         query: str | None = None,
         providers: list[str] | None = None,
         exclude_keywords: list[str] | None = None,
@@ -303,14 +321,16 @@ class Store:
 
         cur = self.conn.execute(
             """INSERT INTO managed_watches
-            (name,query,min_price,max_price,ignore_price_at_or_below,exclude_keywords,providers,daangn_region,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (name,query,min_price,max_price,ignore_price_at_or_below,exclude_buying_posts,exclude_selling_posts,exclude_keywords,providers,daangn_region,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 name,
                 query,
                 min_price,
                 max_price,
                 ignore_price_at_or_below,
+                int(exclude_buying_posts),
+                int(exclude_selling_posts),
                 json.dumps(exclude_keywords or [], ensure_ascii=False),
                 json.dumps(providers or ["daangn", "joongna", "bunjang"]),
                 _encode_regions(split_daangn_regions(region)),
@@ -374,6 +394,21 @@ class Store:
         cur = self.conn.execute(
             "UPDATE managed_watches SET ignore_price_at_or_below=? WHERE id=?",
             (value, watch_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def set_transaction_filters(
+        self,
+        watch_id: int,
+        *,
+        exclude_buying_posts: bool,
+        exclude_selling_posts: bool,
+    ) -> bool:
+        cur = self.conn.execute(
+            "UPDATE managed_watches "
+            "SET exclude_buying_posts=?, exclude_selling_posts=? WHERE id=?",
+            (int(exclude_buying_posts), int(exclude_selling_posts), watch_id),
         )
         self.conn.commit()
         return cur.rowcount > 0

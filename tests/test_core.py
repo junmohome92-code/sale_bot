@@ -32,6 +32,28 @@ def test_watch_filters_price_and_excluded_words():
     assert not watch.matches(Listing("bunjang", "4", "9070 XT", 40000, "https://x"))
 
 
+def test_transaction_type_filters_default_to_buying_only():
+    watch = Watch(name="switch2", query="switch2", max_price=1_000_000)
+    assert not watch.matches(
+        Listing("joongna", "buy-1", "닌텐도 스위치2 삽니다", 600_000, "https://x")
+    )
+    assert not watch.matches(
+        Listing("joongna", "buy-2", "닌텐도 스위치2 구합니다", 600_000, "https://x")
+    )
+    assert watch.matches(
+        Listing("joongna", "sell-1", "닌텐도 스위치2 팝니다", 600_000, "https://x")
+    )
+
+    watch.exclude_buying_posts = False
+    watch.exclude_selling_posts = True
+    assert watch.matches(
+        Listing("joongna", "buy-3", "닌텐도 스위치2 구매합니다", 600_000, "https://x")
+    )
+    assert not watch.matches(
+        Listing("joongna", "sell-2", "닌텐도 스위치2 판매합니다", 600_000, "https://x")
+    )
+
+
 def test_twenty_watch_slots(tmp_path):
     store = Store(tmp_path / "sale.sqlite3")
     try:
@@ -177,7 +199,7 @@ def test_legacy_database_migrates_to_clean_watch_scoped_baseline(tmp_path):
         version = store.conn.execute(
             "SELECT value FROM runtime_state WHERE key='schema_version'"
         ).fetchone()[0]
-        assert version == "3"
+        assert version == "4"
         for old_table in (
             "listings",
             "price_history",
