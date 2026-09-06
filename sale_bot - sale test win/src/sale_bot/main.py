@@ -25,9 +25,7 @@ def _event_should_queue(change: Change, settings: Settings) -> bool:
         return True
     if change.kind == "price_up":
         return settings.alert_on_price_increase
-    if change.kind == "price_changed":
-        return True
-    return False
+    return change.kind == "price_changed"
 
 
 async def _close_providers(providers: dict[str, Provider]) -> None:
