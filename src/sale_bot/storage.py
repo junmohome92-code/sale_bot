@@ -7,7 +7,7 @@ from pathlib import Path
 from .models import Listing, Watch, split_daangn_regions
 
 MAX_WATCH_SLOTS = 20
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -74,6 +74,7 @@ class Store:
               query TEXT NOT NULL,
               min_price INTEGER,
               max_price INTEGER NOT NULL,
+              ignore_price_at_or_below INTEGER NOT NULL DEFAULT 0,
               exclude_keywords TEXT NOT NULL DEFAULT '[]',
               providers TEXT NOT NULL,
               daangn_region TEXT,
@@ -169,6 +170,11 @@ class Store:
         }
         if "min_price" not in columns:
             self.conn.execute("ALTER TABLE managed_watches ADD COLUMN min_price INTEGER")
+        if "ignore_price_at_or_below" not in columns:
+            self.conn.execute(
+                "ALTER TABLE managed_watches ADD COLUMN "
+                "ignore_price_at_or_below INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _migrate_to_watch_scoped_tracking(self, previous_version: int) -> None:
         # Legacy state used only provider+listing id. It cannot be mapped safely to
@@ -214,13 +220,14 @@ class Store:
                 continue
             self.conn.execute(
                 """INSERT OR IGNORE INTO managed_watches
-                (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
-                VALUES (?,?,?,?,?,?,?,?)""",
+                (name,query,min_price,max_price,ignore_price_at_or_below,exclude_keywords,providers,daangn_region,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
                     watch.name,
                     watch.query,
                     watch.min_price,
                     watch.max_price,
+                    watch.ignore_price_at_or_below,
                     json.dumps(watch.exclude_keywords, ensure_ascii=False),
                     json.dumps(watch.providers),
                     _encode_regions(watch.daangn_regions),
@@ -239,6 +246,7 @@ class Store:
             query=str(row["query"]),
             min_price=int(row["min_price"]) if row["min_price"] is not None else None,
             max_price=int(row["max_price"]),
+            ignore_price_at_or_below=int(row["ignore_price_at_or_below"] or 0),
             exclude_keywords=json.loads(row["exclude_keywords"]),
             providers=json.loads(row["providers"]),
             daangn_regions=_decode_regions(row["daangn_region"]),
@@ -270,6 +278,7 @@ class Store:
         region: str | list[str] | None = None,
         *,
         min_price: int | None = None,
+        ignore_price_at_or_below: int = 0,
         query: str | None = None,
         providers: list[str] | None = None,
         exclude_keywords: list[str] | None = None,
@@ -284,6 +293,8 @@ class Store:
             raise ValueError("min_price cannot be negative")
         if min_price is not None and min_price > max_price:
             raise ValueError("min_price cannot exceed max_price")
+        if ignore_price_at_or_below < 0:
+            raise ValueError("ignore_price_at_or_below cannot be negative")
         count = int(self.conn.execute("SELECT COUNT(*) FROM managed_watches").fetchone()[0])
         if count >= MAX_WATCH_SLOTS:
             raise ValueError(f"watch slot limit reached ({MAX_WATCH_SLOTS})")
@@ -292,13 +303,14 @@ class Store:
 
         cur = self.conn.execute(
             """INSERT INTO managed_watches
-            (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
-            VALUES (?,?,?,?,?,?,?,?)""",
+            (name,query,min_price,max_price,ignore_price_at_or_below,exclude_keywords,providers,daangn_region,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 name,
                 query,
                 min_price,
                 max_price,
+                ignore_price_at_or_below,
                 json.dumps(exclude_keywords or [], ensure_ascii=False),
                 json.dumps(providers or ["daangn", "joongna", "bunjang"]),
                 _encode_regions(split_daangn_regions(region)),
@@ -355,6 +367,26 @@ class Store:
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    def set_ignore_price_at_or_below(self, watch_id: int, value: int) -> bool:
+        if value < 0:
+            raise ValueError("ignore_price_at_or_below cannot be negative")
+        cur = self.conn.execute(
+            "UPDATE managed_watches SET ignore_price_at_or_below=? WHERE id=?",
+            (value, watch_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def reset_watch_tracking(self, watch_id: int) -> None:
+        with self.conn:
+            for table in (
+                "pending_alerts",
+                "watch_price_history",
+                "watch_listing_state",
+                "watch_scan_state",
+            ):
+                self.conn.execute(f"DELETE FROM {table} WHERE watch_id=?", (watch_id,))
 
     def set_region(self, watch_id: int, region: str | list[str] | None) -> bool:
         if self.get_watch(watch_id) is None:
