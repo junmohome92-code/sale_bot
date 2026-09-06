@@ -98,10 +98,10 @@ class DaangnRuntimeProvider(legacy.DaangnProvider):
         payload = response.json()
         all_page = payload.get("allPage")
         if not isinstance(all_page, dict):
-            raise RuntimeError("Daangn search payload shape changed: allPage missing")
+            raise TypeError("Daangn search payload shape changed: allPage missing")
         articles = all_page.get("fleamarketArticles")
         if not isinstance(articles, list):
-            raise RuntimeError("Daangn search payload shape changed: fleamarketArticles missing")
+            raise TypeError("Daangn search payload shape changed: fleamarketArticles missing")
         return [article for article in articles if isinstance(article, dict)]
 
     async def search_region(self, watch: Watch, region_name: str | None) -> list[Listing]:
