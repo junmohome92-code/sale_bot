@@ -21,12 +21,15 @@ class FakeResponse:
 
 class FakeJoongnaClient:
     def __init__(self):
-        self.pages = []
+        self.calls = []
 
     async def post(self, _url, json):
+        search_word = str(json["searchWord"])
         page = int(json["page"])
-        self.pages.append(page)
-        if page == 0:
+        self.calls.append((search_word, page))
+        if page != 0:
+            return FakeResponse({"data": {"items": []}})
+        if search_word == "청주시 닌텐도 스위치2":
             return FakeResponse(
                 {
                     "data": {
@@ -45,6 +48,29 @@ class FakeJoongnaClient:
                                 "price": 700000,
                                 "state": 0,
                                 "locationNames": ["대전광역시 유성구 봉명동"],
+                            },
+                        ]
+                    }
+                }
+            )
+        if search_word == "세종시 닌텐도 스위치2":
+            return FakeResponse(
+                {
+                    "data": {
+                        "items": [
+                            {
+                                "seq": 21,
+                                "title": "닌텐도 스위치2 마리오카트 세트",
+                                "price": 690000,
+                                "state": 0,
+                                "locationNames": ["세종특별자치시 세종특별자치시 보람동"],
+                            },
+                            {
+                                "seq": 11,
+                                "title": "닌텐도 스위치2 본체",
+                                "price": 640000,
+                                "state": 0,
+                                "locationNames": ["충청북도 청주시 흥덕구 복대동"],
                             },
                         ]
                     }
@@ -157,7 +183,7 @@ def test_watch_keyboard_exposes_ignore_price_button():
     assert "🚫 무시가격" in labels
 
 
-def test_joongna_api_uses_structured_location_for_city_filter():
+def test_joongna_api_searches_each_configured_city_and_deduplicates():
     provider = JoongnaRuntimeProvider()
     real_client = provider.client
     fake = FakeJoongnaClient()
@@ -173,10 +199,18 @@ def test_joongna_api_uses_structured_location_for_city_filter():
     finally:
         asyncio.run(fake.aclose())
         asyncio.run(real_client.aclose())
-    assert fake.pages == [0, 1]
-    assert listings[0].location == "충청북도 청주시 흥덕구 복대동"
-    assert listing_matches_market_city(watch, listings[0])
-    assert not listing_matches_market_city(watch, listings[1])
+
+    assert fake.calls == [
+        ("청주시 닌텐도 스위치2", 0),
+        ("세종시 닌텐도 스위치2", 0),
+    ]
+    assert {listing.external_id for listing in listings} == {"11", "12", "21"}
+    by_id = {listing.external_id: listing for listing in listings}
+    assert by_id["11"].location == "충청북도 청주시 흥덕구 복대동"
+    assert by_id["21"].location == "세종특별자치시 세종특별자치시 보람동"
+    assert listing_matches_market_city(watch, by_id["11"])
+    assert listing_matches_market_city(watch, by_id["21"])
+    assert not listing_matches_market_city(watch, by_id["12"])
 
 
 def test_bunjang_api_uses_structured_location_for_city_filter():
