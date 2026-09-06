@@ -160,7 +160,7 @@ class BunjangRuntimeProvider(BunjangProvider):
                     "Bunjang search cards did not load; page structure or access may have changed"
                 )
             cards = await page.locator('a[href*="/products/"]').evaluate_all(
-                """
+                r"""
                 (els, cityKeys) => els.map(a => {
                   const texts = [...a.querySelectorAll('div,span,p')]
                     .map(n => (n.textContent || '').trim())
