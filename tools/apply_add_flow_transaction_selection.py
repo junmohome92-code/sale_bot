@@ -1,0 +1,36 @@
+from pathlib import Path
+
+admin_path = Path('src/sale_bot/admin.py')
+text = admin_path.read_text(encoding='utf-8')
+
+old = '''def _format_transaction_filters(watch: Watch) -> str:\n    buying = "삽니다 제외" if watch.exclude_buying_posts else "삽니다 허용"\n    selling = "팝니다 제외" if watch.exclude_selling_posts else "팝니다 허용"\n    return f"{buying} · {selling}"\n'''
+new = '''def _format_transaction_selection(\n    exclude_buying_posts: bool, exclude_selling_posts: bool\n) -> str:\n    buying = "삽니다 제외" if exclude_buying_posts else "삽니다 허용"\n    selling = "팝니다 제외" if exclude_selling_posts else "팝니다 허용"\n    return f"{buying} · {selling}"\n\n\ndef _format_transaction_filters(watch: Watch) -> str:\n    return _format_transaction_selection(\n        watch.exclude_buying_posts, watch.exclude_selling_posts\n    )\n\n\ndef _add_transaction_keyboard(\n    exclude_buying_posts: bool, exclude_selling_posts: bool\n) -> dict:\n    buying_text = "✅ 삽니다 제외" if exclude_buying_posts else "⬜ 삽니다 허용"\n    selling_text = "✅ 팝니다 제외" if exclude_selling_posts else "⬜ 팝니다 허용"\n    return {\n        "inline_keyboard": [\n            [\n                {"text": buying_text, "callback_data": "session:add_transaction:buying"},\n                {"text": selling_text, "callback_data": "session:add_transaction:selling"},\n            ],\n            [{"text": "➡️ 다음", "callback_data": "session:add_transaction:next"}],\n            [{"text": "❌ 취소", "callback_data": "session:cancel"}],\n        ]\n    }\n\n\ndef _add_transaction_text(exclude_buying_posts: bool, exclude_selling_posts: bool) -> str:\n    return (\n        "🧾 거래유형을 선택해주세요.\\n\\n"\n        f"현재: {_format_transaction_selection(exclude_buying_posts, exclude_selling_posts)}\\n"\n        "버튼으로 제외/허용을 바꾼 뒤 '다음'을 눌러주세요."\n    )\n'''
+assert old in text
+text = text.replace(old, new)
+
+old = '''        session.data["ignore_price_at_or_below"] = ignore_price\n        session.step = "add_region"\n        await _send(\n            client,\n            token,\n            chat_id,\n            "📍 당근 지역을 입력해주세요.\\n"\n            "한 곳: 청주시 청원구\\n"\n            "여러 곳: 청주시, 세종시\\n"\n            "또는: 청주시 청원구, 세종시\\n\\n"\n            "중고나라/번개장터는 입력 지역들의 시 단위로 검색합니다.\\n"\n            "지역을 쓰지 않으려면 '건너뛰기'를 입력하세요.",\n        )\n        return True\n'''
+new = '''        session.data["ignore_price_at_or_below"] = ignore_price\n        session.data["exclude_buying_posts"] = True\n        session.data["exclude_selling_posts"] = False\n        session.step = "add_transaction"\n        await _send(\n            client,\n            token,\n            chat_id,\n            _add_transaction_text(True, False),\n            _add_transaction_keyboard(True, False),\n        )\n        return True\n'''
+assert old in text
+text = text.replace(old, new)
+
+old = '''            "🧾 거래유형: 삽니다 제외 · 팝니다 허용\\n"\n'''
+new = '''            f"🧾 거래유형: {_format_transaction_selection(bool(session.data.get('exclude_buying_posts', True)), bool(session.data.get('exclude_selling_posts', False)))}\\n"\n'''
+assert old in text
+text = text.replace(old, new)
+
+anchor = '''        elif data.startswith("watch:"):\n'''
+insert = '''        elif data.startswith("session:add_transaction:"):\n            session = _SESSIONS.get(chat_id)\n            if session is None or session.step != "add_transaction":\n                await _send(\n                    client,\n                    token,\n                    chat_id,\n                    "입력 세션이 만료되었습니다. 다시 추가해주세요.",\n                    _menu_keyboard(),\n                )\n                return\n            action = data.rsplit(":", 1)[1]\n            exclude_buying = bool(session.data.get("exclude_buying_posts", True))\n            exclude_selling = bool(session.data.get("exclude_selling_posts", False))\n            if action == "buying":\n                exclude_buying = not exclude_buying\n            elif action == "selling":\n                exclude_selling = not exclude_selling\n            elif action == "next":\n                session.step = "add_region"\n                await _send(\n                    client,\n                    token,\n                    chat_id,\n                    "📍 당근 지역을 입력해주세요.\\n"\n                    "한 곳: 청주시 청원구\\n"\n                    "여러 곳: 청주시, 세종시\\n"\n                    "또는: 청주시 청원구, 세종시\\n\\n"\n                    "중고나라/번개장터는 입력 지역들의 시 단위로 검색합니다.\\n"\n                    "지역을 쓰지 않으려면 '건너뛰기'를 입력하세요.",\n                )\n                return\n            else:\n                return\n            session.data["exclude_buying_posts"] = exclude_buying\n            session.data["exclude_selling_posts"] = exclude_selling\n            _touch(session)\n            await _send(\n                client,\n                token,\n                chat_id,\n                _add_transaction_text(exclude_buying, exclude_selling),\n                _add_transaction_keyboard(exclude_buying, exclude_selling),\n            )\n\n'''
+assert anchor in text
+text = text.replace(anchor, insert + anchor, 1)
+
+old = '''                ignore_price_at_or_below=int(\n                    session.data.get("ignore_price_at_or_below", 0)\n                ),\n            )\n'''
+new = '''                ignore_price_at_or_below=int(\n                    session.data.get("ignore_price_at_or_below", 0)\n                ),\n                exclude_buying_posts=bool(\n                    session.data.get("exclude_buying_posts", True)\n                ),\n                exclude_selling_posts=bool(\n                    session.data.get("exclude_selling_posts", False)\n                ),\n            )\n'''
+assert old in text
+text = text.replace(old, new, 1)
+admin_path.write_text(text, encoding='utf-8')
+
+test_path = Path('tests/test_core.py')
+tests = test_path.read_text(encoding='utf-8')
+addition = '''\n\ndef test_add_flow_asks_transaction_type_before_region(monkeypatch):\n    sent = []\n\n    async def fake_send(_client, _token, _chat_id, text, markup=None):\n        sent.append((text, markup))\n\n    monkeypatch.setattr(admin, "_send", fake_send)\n    session = admin.AdminSession(step="add_ignore_price", data={})\n    handled = asyncio.run(\n        admin._handle_session_text(object(), "token", "1", "50000", session)\n    )\n\n    assert handled\n    assert session.step == "add_transaction"\n    assert session.data["exclude_buying_posts"] is True\n    assert session.data["exclude_selling_posts"] is False\n    assert "거래유형을 선택" in sent[-1][0]\n    labels = [\n        button["text"]\n        for row in sent[-1][1]["inline_keyboard"]\n        for button in row\n    ]\n    assert "✅ 삽니다 제외" in labels\n    assert "⬜ 팝니다 허용" in labels\n    assert "➡️ 다음" in labels\n\n\ndef test_add_transaction_keyboard_can_show_opposite_selection():\n    keyboard = admin._add_transaction_keyboard(False, True)\n    labels = [\n        button["text"]\n        for row in keyboard["inline_keyboard"]\n        for button in row\n    ]\n    assert "⬜ 삽니다 허용" in labels\n    assert "✅ 팝니다 제외" in labels\n    assert admin._format_transaction_selection(False, True) == "삽니다 허용 · 팝니다 제외"\n'''
+assert 'test_add_flow_asks_transaction_type_before_region' not in tests
+test_path.write_text(tests + addition, encoding='utf-8')
