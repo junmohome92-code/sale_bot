@@ -70,6 +70,7 @@ class Store:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               name TEXT NOT NULL UNIQUE,
               query TEXT NOT NULL,
+              min_price INTEGER,
               max_price INTEGER NOT NULL,
               exclude_keywords TEXT NOT NULL DEFAULT '[]',
               providers TEXT NOT NULL,
@@ -84,19 +85,39 @@ class Store:
               alerted_at TEXT NOT NULL,
               PRIMARY KEY (watch_name, provider, external_id)
             );
+            CREATE TABLE IF NOT EXISTS alert_candidates (
+              watch_name TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              external_id TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              old_price INTEGER,
+              new_price INTEGER,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (watch_name, provider, external_id)
+            );
             CREATE TABLE IF NOT EXISTS app_state (
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL
             );
             """
         )
+        self._ensure_managed_watch_columns()
         self.conn.commit()
-        self._upgrade_alert_receipts_guard()
+
+    def _ensure_managed_watch_columns(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(managed_watches)").fetchall()
+        }
+        if "min_price" not in columns:
+            self.conn.execute("ALTER TABLE managed_watches ADD COLUMN min_price INTEGER")
 
     def _row_to_watch(self, row: sqlite3.Row) -> Watch:
         return Watch(
             name=row["name"],
             query=row["query"],
+            min_price=int(row["min_price"]) if row["min_price"] is not None else None,
             max_price=int(row["max_price"]),
             exclude_keywords=json.loads(row["exclude_keywords"]),
             providers=json.loads(row["providers"]),
@@ -139,34 +160,53 @@ class Store:
         )
         self.conn.commit()
 
+    def _backfill_min_price_from_seed(self, watches: list[Watch]) -> None:
+        marker = "managed_watches_min_price_backfill_v1"
+        if self.conn.execute("SELECT 1 FROM app_state WHERE key=?", (marker,)).fetchone():
+            return
+        for watch in watches:
+            if watch.min_price is None:
+                continue
+            self.conn.execute(
+                """UPDATE managed_watches SET min_price=?
+                WHERE name=? AND min_price IS NULL""",
+                (watch.min_price, watch.name),
+            )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_state(key,value) VALUES (?,?)", (marker, "1")
+        )
+        self.conn.commit()
+
     def seed_watches(self, watches: list[Watch]) -> None:
         seeded = self.conn.execute(
             "SELECT 1 FROM app_state WHERE key='managed_watches_seeded'"
         ).fetchone()
-        if seeded:
-            return
-        now = datetime.now(UTC).isoformat()
-        for watch in watches[:MAX_WATCH_SLOTS]:
-            if watch.max_price is None:
-                continue
+        if not seeded:
+            now = datetime.now(UTC).isoformat()
+            for watch in watches[:MAX_WATCH_SLOTS]:
+                if watch.max_price is None:
+                    continue
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO managed_watches
+                    (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        watch.name,
+                        watch.query,
+                        watch.min_price,
+                        watch.max_price,
+                        json.dumps(watch.exclude_keywords, ensure_ascii=False),
+                        json.dumps(watch.providers),
+                        _encode_regions(watch.daangn_regions),
+                        now,
+                    ),
+                )
             self.conn.execute(
-                """INSERT OR IGNORE INTO managed_watches
-                (name,query,max_price,exclude_keywords,providers,daangn_region,created_at)
-                VALUES (?,?,?,?,?,?,?)""",
-                (
-                    watch.name,
-                    watch.query,
-                    watch.max_price,
-                    json.dumps(watch.exclude_keywords, ensure_ascii=False),
-                    json.dumps(watch.providers),
-                    _encode_regions(watch.daangn_regions),
-                    now,
-                ),
+                "INSERT OR REPLACE INTO app_state(key,value) VALUES ('managed_watches_seeded','1')"
             )
-        self.conn.execute(
-            "INSERT OR REPLACE INTO app_state(key,value) VALUES ('managed_watches_seeded','1')"
-        )
-        self.conn.commit()
+            self.conn.commit()
+        self._backfill_min_price_from_seed(watches)
+        self._upgrade_alert_receipts_guard()
 
     def list_watches(self, *, enabled_only: bool = False) -> list[tuple[int, Watch, bool]]:
         sql = "SELECT * FROM managed_watches"
@@ -178,12 +218,23 @@ class Store:
             (int(row["id"]), self._row_to_watch(row), bool(row["enabled"])) for row in rows
         ]
 
-    def add_watch(self, name: str, max_price: int, region: str | list[str] | None = None) -> int:
+    def add_watch(
+        self,
+        name: str,
+        max_price: int,
+        region: str | list[str] | None = None,
+        *,
+        min_price: int | None = None,
+    ) -> int:
         name = name.strip()
         if not name:
             raise ValueError("watch name is required")
         if max_price <= 0:
             raise ValueError("max_price must be positive")
+        if min_price is not None and min_price < 0:
+            raise ValueError("min_price cannot be negative")
+        if min_price is not None and min_price > max_price:
+            raise ValueError("min_price cannot exceed max_price")
         count = int(self.conn.execute("SELECT COUNT(*) FROM managed_watches").fetchone()[0])
         if count >= MAX_WATCH_SLOTS:
             raise ValueError(f"watch slot limit reached ({MAX_WATCH_SLOTS})")
@@ -193,11 +244,12 @@ class Store:
         now = datetime.now(UTC).isoformat()
         cur = self.conn.execute(
             """INSERT INTO managed_watches
-            (name,query,max_price,exclude_keywords,providers,daangn_region,created_at)
-            VALUES (?,?,?,'[]',?,?,?)""",
+            (name,query,min_price,max_price,exclude_keywords,providers,daangn_region,created_at)
+            VALUES (?,?,?,?,'[]',?,?,?)""",
             (
                 name,
                 name,
+                min_price,
                 max_price,
                 json.dumps(["daangn", "joongna", "bunjang"]),
                 _encode_regions(split_daangn_regions(region)),
@@ -217,6 +269,7 @@ class Store:
         self.conn.execute("DELETE FROM managed_watches WHERE id=?", (watch_id,))
         self.conn.execute("DELETE FROM scan_state WHERE watch_name=?", (watch_name,))
         self.conn.execute("DELETE FROM alert_receipts WHERE watch_name=?", (watch_name,))
+        self.conn.execute("DELETE FROM alert_candidates WHERE watch_name=?", (watch_name,))
         self.conn.execute("DELETE FROM app_state WHERE key=?", (f"daangn_batch:{watch_name}",))
         self.conn.commit()
         return True
@@ -229,21 +282,62 @@ class Store:
         return cur.rowcount > 0
 
     def set_max_price(self, watch_id: int, max_price: int) -> bool:
+        row = self.conn.execute(
+            "SELECT min_price FROM managed_watches WHERE id=?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        min_price = row["min_price"]
         if max_price <= 0:
             raise ValueError("max_price must be positive")
-        cur = self.conn.execute(
+        if min_price is not None and int(min_price) > max_price:
+            raise ValueError("max_price cannot be lower than min_price")
+        self.conn.execute(
             "UPDATE managed_watches SET max_price=? WHERE id=?", (max_price, watch_id)
+        )
+        self.conn.commit()
+        return True
+
+    def set_price_range(
+        self, watch_id: int, min_price: int | None, max_price: int
+    ) -> bool:
+        if max_price <= 0:
+            raise ValueError("max_price must be positive")
+        if min_price is not None and min_price < 0:
+            raise ValueError("min_price cannot be negative")
+        if min_price is not None and min_price > max_price:
+            raise ValueError("min_price cannot exceed max_price")
+        cur = self.conn.execute(
+            "UPDATE managed_watches SET min_price=?,max_price=? WHERE id=?",
+            (min_price, max_price, watch_id),
         )
         self.conn.commit()
         return cur.rowcount > 0
 
+    def _reset_daangn_state(self, watch_name: str) -> None:
+        self.conn.execute(
+            "DELETE FROM scan_state WHERE watch_name=? AND provider LIKE 'daangn%'",
+            (watch_name,),
+        )
+        self.conn.execute(
+            "DELETE FROM alert_candidates WHERE watch_name=? AND provider='daangn'",
+            (watch_name,),
+        )
+        self.conn.execute("DELETE FROM app_state WHERE key=?", (f"daangn_batch:{watch_name}",))
+
     def set_region(self, watch_id: int, region: str | list[str] | None) -> bool:
-        cur = self.conn.execute(
+        row = self.conn.execute(
+            "SELECT name FROM managed_watches WHERE id=?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        self.conn.execute(
             "UPDATE managed_watches SET daangn_region=? WHERE id=?",
             (_encode_regions(split_daangn_regions(region)), watch_id),
         )
+        self._reset_daangn_state(str(row["name"]))
         self.conn.commit()
-        return cur.rowcount > 0
+        return True
 
     def next_daangn_batch(self, watch_name: str, batch_count: int) -> int:
         batch_count = max(1, batch_count)
@@ -295,8 +389,57 @@ class Store:
             (watch_name,provider,external_id,alerted_at) VALUES (?,?,?,?)""",
             (watch_name, listing.provider, listing.external_id, now),
         )
+        self.conn.execute(
+            """DELETE FROM alert_candidates
+            WHERE watch_name=? AND provider=? AND external_id=?""",
+            (watch_name, listing.provider, listing.external_id),
+        )
         self.conn.commit()
         return cur.rowcount > 0
+
+    def queue_alert(self, watch_name: str, listing: Listing, change: Change) -> None:
+        now = datetime.now(UTC).isoformat()
+        self.conn.execute(
+            """INSERT INTO alert_candidates
+            (watch_name,provider,external_id,reason,old_price,new_price,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(watch_name,provider,external_id) DO UPDATE SET
+              reason=CASE WHEN excluded.reason='same' THEN alert_candidates.reason
+                          ELSE excluded.reason END,
+              old_price=CASE WHEN excluded.reason='same' THEN alert_candidates.old_price
+                             ELSE excluded.old_price END,
+              new_price=excluded.new_price,
+              updated_at=excluded.updated_at""",
+            (
+                watch_name,
+                listing.provider,
+                listing.external_id,
+                change.kind,
+                change.old_price,
+                listing.price,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+
+    def pending_alert_change(self, watch_name: str, listing: Listing) -> Change | None:
+        row = self.conn.execute(
+            """SELECT reason,old_price,new_price FROM alert_candidates
+            WHERE watch_name=? AND provider=? AND external_id=?""",
+            (watch_name, listing.provider, listing.external_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return Change(str(row["reason"]), row["old_price"], row["new_price"])
+
+    def clear_pending_alert(self, watch_name: str, listing: Listing) -> None:
+        self.conn.execute(
+            """DELETE FROM alert_candidates
+            WHERE watch_name=? AND provider=? AND external_id=?""",
+            (watch_name, listing.provider, listing.external_id),
+        )
+        self.conn.commit()
 
     def observe(self, listing: Listing) -> Change:
         now = datetime.now(UTC).isoformat()

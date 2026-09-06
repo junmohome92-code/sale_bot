@@ -13,8 +13,13 @@ class Settings:
     alert_on_price_increase: bool
     bootstrap_silently: bool
     request_timeout_seconds: int
-    daangn_full_region_batches: int
+    daangn_region_batches: int
     watches: list[Watch]
+
+    @property
+    def daangn_full_region_batches(self) -> int:
+        """Backward-compatible name used by older code/config docs."""
+        return self.daangn_region_batches
 
 
 def load_settings(path: str | Path) -> Settings:
@@ -36,19 +41,23 @@ def load_settings(path: str | Path) -> Settings:
         if not watch.providers:
             raise ValueError(f"watch {watch.name} must contain at least one provider")
         split_daangn_regions(watch.daangn_regions)
-        if (
-            watch.min_price is not None
-            and watch.max_price is not None
-            and watch.min_price > watch.max_price
-        ):
+        if watch.max_price is None or watch.max_price <= 0:
+            raise ValueError(f"watch {watch.name}: max_price must be a positive integer")
+        if watch.min_price is not None and watch.min_price < 0:
+            raise ValueError(f"watch {watch.name}: min_price cannot be negative")
+        if watch.min_price is not None and watch.min_price > watch.max_price:
             raise ValueError(f"watch {watch.name}: min_price cannot exceed max_price")
 
+    batch_value = raw.get(
+        "daangn_region_batches",
+        raw.get("daangn_full_region_batches", 5),
+    )
     return Settings(
         poll_interval_seconds=max(60, int(raw.get("poll_interval_seconds", 300))),
         alert_on_first_seen=bool(raw.get("alert_on_first_seen", True)),
         alert_on_price_increase=bool(raw.get("alert_on_price_increase", False)),
         bootstrap_silently=bool(raw.get("bootstrap_silently", True)),
         request_timeout_seconds=max(5, int(raw.get("request_timeout_seconds", 20))),
-        daangn_full_region_batches=max(1, min(10, int(raw.get("daangn_full_region_batches", 5)))),
+        daangn_region_batches=max(1, min(20, int(batch_value))),
         watches=watches,
     )
